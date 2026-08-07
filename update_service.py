@@ -8,10 +8,12 @@ import subprocess
 import sys
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -76,6 +78,89 @@ def _read_limited(response: Any, maximum: int) -> bytes:
     return payload
 
 
+def _github_limit_message(error: urllib.error.HTTPError) -> str:
+    headers = error.headers or {}
+    retry_after = headers.get("Retry-After")
+    if retry_after:
+        try:
+            seconds = max(1, int(retry_after))
+        except (TypeError, ValueError):
+            pass
+        else:
+            minutes = max(1, (seconds + 59) // 60)
+            return (
+                "GitHub временно ограничил проверку обновлений. "
+                f"Повторите примерно через {minutes} мин."
+            )
+
+    remaining = headers.get("X-RateLimit-Remaining")
+    reset = headers.get("X-RateLimit-Reset")
+    if remaining == "0" and reset:
+        try:
+            reset_time = datetime.fromtimestamp(int(reset)).astimezone()
+        except (OSError, OverflowError, TypeError, ValueError):
+            pass
+        else:
+            return (
+                "GitHub временно исчерпал лимит проверок для вашего IP. "
+                f"Повторите после {reset_time:%H:%M}."
+            )
+
+    return f"GitHub временно отклонил запрос проверки обновлений (HTTP {error.code})."
+
+
+def _fetch_latest_release_from_page(
+    repository: str,
+    timeout: float,
+    opener: Callable[..., Any],
+) -> ReleaseInfo:
+    latest_url = f"https://github.com/{repository}/releases/latest"
+    request = urllib.request.Request(
+        latest_url,
+        headers={
+            "Accept": "text/html,application/xhtml+xml",
+            "User-Agent": "MacroPilot-Updater",
+        },
+    )
+    try:
+        with opener(request, timeout=timeout) as response:
+            final_url = str(response.geturl())
+    except urllib.error.HTTPError as exc:
+        raise UpdateError(f"Запасная проверка релиза вернула HTTP {exc.code}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise UpdateError(f"Не удалось открыть страницу последнего релиза: {exc}") from exc
+
+    parsed = urllib.parse.urlparse(final_url)
+    expected_path = f"/{repository}/releases/tag/"
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold() not in {"github.com", "www.github.com"}
+        or not parsed.path.casefold().startswith(expected_path.casefold())
+    ):
+        raise UpdateError("GitHub не указал версию последнего релиза")
+
+    tag = urllib.parse.unquote(parsed.path[len(expected_path) :]).strip("/")
+    version = ".".join(str(part) for part in parse_version(tag))
+    encoded_tag = urllib.parse.quote(tag, safe="")
+    page_url = f"https://github.com/{repository}/releases/tag/{encoded_tag}"
+    asset_base = f"https://github.com/{repository}/releases/download/{encoded_tag}"
+    assets = tuple(
+        ReleaseAsset(
+            name=name,
+            download_url=f"{asset_base}/{urllib.parse.quote(name, safe='')}",
+            size=0,
+        )
+        for name in (WINDOWS_RELEASE_ASSET, SOURCE_RELEASE_ASSET)
+    )
+    return ReleaseInfo(
+        version=version,
+        title=f"MacroPilot {version}",
+        notes="",
+        page_url=page_url,
+        assets=assets,
+    )
+
+
 def fetch_latest_release(
     repository: str,
     timeout: float = 10.0,
@@ -98,6 +183,13 @@ def fetch_latest_release(
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             raise UpdateError("В репозитории пока нет опубликованных релизов") from exc
+        if exc.code in {403, 429}:
+            try:
+                return _fetch_latest_release_from_page(repository, timeout, opener)
+            except UpdateError as fallback_error:
+                raise UpdateError(
+                    f"{_github_limit_message(exc)} {fallback_error}"
+                ) from exc
         raise UpdateError(f"GitHub вернул ошибку HTTP {exc.code}") from exc
     except (OSError, urllib.error.URLError) as exc:
         raise UpdateError(f"Не удалось связаться с GitHub: {exc}") from exc

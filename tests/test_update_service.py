@@ -3,6 +3,7 @@ import io
 import json
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -21,11 +22,15 @@ from update_service import (
 
 
 class FakeResponse(io.BytesIO):
-    def __init__(self, payload: bytes, content_length=None):
+    def __init__(self, payload: bytes, content_length=None, url="https://example.test"):
         super().__init__(payload)
         self.headers = {
             "Content-Length": str(len(payload)) if content_length is None else content_length
         }
+        self.url = url
+
+    def geturl(self):
+        return self.url
 
     def __enter__(self):
         return self
@@ -77,6 +82,59 @@ class UpdateServiceTests(unittest.TestCase):
         self.assertEqual(release.version, "1.6.0")
         self.assertEqual(choose_release_asset(release, frozen=True).name, "MacroPilot-windows.zip")
         self.assertEqual(choose_release_asset(release, frozen=False).name, "MacroPilot-source.zip")
+
+    def test_rate_limit_uses_public_release_page_fallback(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request.full_url, timeout))
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    request.full_url,
+                    403,
+                    "Forbidden",
+                    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "4102444800"},
+                    io.BytesIO(b""),
+                )
+            return FakeResponse(
+                b"",
+                url="https://github.com/Not-Config/MacroPilot/releases/tag/v1.5.1",
+            )
+
+        release = fetch_latest_release("Not-Config/MacroPilot", opener=opener)
+
+        self.assertEqual(release.version, "1.5.1")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            choose_release_asset(release, frozen=True).download_url,
+            "https://github.com/Not-Config/MacroPilot/releases/download/"
+            "v1.5.1/MacroPilot-windows.zip",
+        )
+
+    def test_rate_limit_reports_wait_when_fallback_is_unavailable(self):
+        calls = 0
+
+        def opener(request, timeout):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                headers = {
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Reset": "4102444800",
+                }
+            else:
+                headers = {}
+            raise urllib.error.HTTPError(
+                request.full_url,
+                403,
+                "Forbidden",
+                headers,
+                io.BytesIO(b""),
+            )
+
+        with self.assertRaisesRegex(UpdateError, "лимит проверок"):
+            fetch_latest_release("Not-Config/MacroPilot", opener=opener)
+        self.assertEqual(calls, 2)
 
     def test_download_verifies_digest_and_archive_layout(self):
         payload = make_zip({"MacroPilot/main.py": "print('ok')", "MacroPilot/README.md": "readme"})

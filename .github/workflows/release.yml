@@ -55,7 +55,7 @@ jobs:
         run: |
           New-Item -ItemType Directory -Path release/MacroPilot -Force | Out-Null
           Copy-Item dist/MacroPilot.exe release/MacroPilot/
-          Copy-Item README.md,SUPPORT.md,CHANGELOG.md release/MacroPilot/
+          Copy-Item README.md,SUPPORT.md,CHANGELOG.md,LICENSE release/MacroPilot/
           Compress-Archive -Path release/MacroPilot -DestinationPath MacroPilot-windows.zip -Force
           git archive --format=zip --prefix=MacroPilot/ -o MacroPilot-source.zip HEAD
       - name: Create version tag

@@ -25,3 +25,4 @@ python -m py_compile main.py macro_core.py windows_input.py update_service.py pr
 
 4. В Pull Request кратко опишите причину, изменения и результат тестов.
 
+Отправляя изменения в проект, вы соглашаетесь на их распространение на условиях [лицензии MIT](LICENSE).
