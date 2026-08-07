@@ -111,8 +111,12 @@ class AutomationRunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_mouse = main.mouse
         self.original_keyboard = main.keyboard
+        self.original_windows_native_available = main.WINDOWS_NATIVE_AVAILABLE
         self.mouse_controller = FakeMouseController()
         self.keyboard_controller = FakeKeyboardController()
+        # Generic runner tests must use the injected fake controllers on every
+        # operating system. Native SendInput selection has its own focused test.
+        main.WINDOWS_NATIVE_AVAILABLE = False
         main.mouse = types.SimpleNamespace(
             Button=types.SimpleNamespace(left="mouse:left", right="mouse:right", middle="mouse:middle"),
             Controller=lambda: self.mouse_controller,
@@ -126,6 +130,7 @@ class AutomationRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         main.mouse = self.original_mouse
         main.keyboard = self.original_keyboard
+        main.WINDOWS_NATIVE_AVAILABLE = self.original_windows_native_available
 
     def test_executes_script_commands(self) -> None:
         finished = []
@@ -172,14 +177,18 @@ class AutomationRunnerTests(unittest.TestCase):
         program = parse_script("DOWN left\nKEY_DOWN ctrl\nWAIT 100")
         worker = threading.Thread(target=runner.run_script, args=(program.nodes,))
         worker.start()
-        self.assertTrue(entered_wait.wait(1), "runner did not reach WAIT")
-        runner.stop()
-        worker.join(1)
+        try:
+            self.assertTrue(entered_wait.wait(1), "runner did not reach WAIT")
+            runner.stop()
+            worker.join(1)
 
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(finished, [(True, None)])
-        self.assertIn(("release", "mouse:left"), self.mouse_controller.log)
-        self.assertIn(("release", "key:ctrl"), self.keyboard_controller.log)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(finished, [(True, None)])
+            self.assertIn(("release", "mouse:left"), self.mouse_controller.log)
+            self.assertIn(("release", "key:ctrl"), self.keyboard_controller.log)
+        finally:
+            runner.stop()
+            worker.join(1)
 
     def test_recorder_accepts_pynput_18_injected_argument(self) -> None:
         stops = []
@@ -428,13 +437,17 @@ class AutomationRunnerTests(unittest.TestCase):
         ]
         worker = threading.Thread(target=runner.run_recording, args=(events, None))
         worker.start()
-        self.assertTrue(second_click.wait(1), "infinite repeat did not start a second cycle")
-        runner.stop()
-        worker.join(1)
+        try:
+            self.assertTrue(second_click.wait(1), "infinite repeat did not start a second cycle")
+            runner.stop()
+            worker.join(1)
 
-        self.assertFalse(worker.is_alive())
-        self.assertGreaterEqual(press_count, 2)
-        self.assertEqual(finished, [(True, None)])
+            self.assertFalse(worker.is_alive())
+            self.assertGreaterEqual(press_count, 2)
+            self.assertEqual(finished, [(True, None)])
+        finally:
+            runner.stop()
+            worker.join(1)
 
 
 if __name__ == "__main__":
