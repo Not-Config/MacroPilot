@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from macro_core import (
     MACRO_FORMAT,
@@ -108,6 +109,44 @@ class MacroFormatTests(unittest.TestCase):
         self.assertEqual(document["format"], MACRO_FORMAT)
         self.assertEqual([item["t"] for item in loaded], [0.1, 0.4, 0.5, 0.6])
         self.assertEqual(macro_duration(loaded), 0.6)
+
+    def test_save_uses_compact_json(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "compact.macro.json"
+            save_macro(path, self.events)
+            text = path.read_text(encoding="utf-8")
+
+        self.assertEqual(text.count("\n"), 1)
+        self.assertNotIn("\n ", text)
+        self.assertEqual(json.loads(text)["format"], MACRO_FORMAT)
+
+    def test_load_keeps_legacy_pretty_json_compatible(self) -> None:
+        document = {
+            "format": MACRO_FORMAT,
+            "version": 1,
+            "created_at": "2026-08-07T00:00:00+00:00",
+            "events": self.events,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.macro.json"
+            path.write_text(
+                json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            loaded = load_macro(path)
+
+        self.assertEqual([item["t"] for item in loaded], [0.1, 0.4, 0.5, 0.6])
+
+    def test_oversized_save_keeps_existing_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "existing.macro.json"
+            path.write_text("original", encoding="utf-8")
+            with patch("macro_core.MAX_MACRO_BYTES", 64):
+                with self.assertRaisesRegex(MacroFormatError, "безопасного лимита"):
+                    save_macro(path, self.events)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "original")
+            self.assertFalse(path.with_name(path.name + ".tmp").exists())
 
     def test_conversion_creates_valid_script(self) -> None:
         text = events_to_script(self.events)
