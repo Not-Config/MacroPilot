@@ -1,0 +1,14 @@
+# MacroPilot: пример собственного сценария
+# Наведите курсор в безопасную тестовую область и нажмите «Запустить».
+
+MOVE 500 350 0.4
+CLICK left
+WAIT 0.5
+TYPE "Привет из MacroPilot!" 0.04
+PRESS enter
+
+REPEAT 3
+    MOVE_BY 80 0 0.2
+    CLICK left
+    WAIT 0.3
+END
