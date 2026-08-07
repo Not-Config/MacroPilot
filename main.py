@@ -805,6 +805,17 @@ class AutomationRunner:
     def _wait(self, seconds: float) -> bool:
         return not self.stop_event.wait(max(0.0, seconds / self.speed))
 
+    def _wait_until(self, deadline: float) -> bool:
+        """Wait for an absolute clock deadline without accumulating drift."""
+
+        while not self.stop_event.is_set():
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return True
+            if self.stop_event.wait(remaining):
+                return False
+        return False
+
     def _track_press(self, collection: list[Any], item: Any) -> None:
         if item not in collection:
             collection.append(item)
@@ -969,6 +980,8 @@ class AutomationRunner:
         def task() -> None:
             if not normalized:
                 return
+            playback_started = time.perf_counter()
+            recording_duration = max(0.0, float(normalized[-1]["t"]))
             repeat_index = 0
             last_progress_at = -1.0
             while repeats is None or repeat_index < repeats:
@@ -978,14 +991,22 @@ class AutomationRunner:
                     total = "∞" if repeats is None else str(repeats)
                     self.on_progress(f"Повтор {repeat_index + 1} из {total}")
                     last_progress_at = now
+                repeat_offset = repeat_index * recording_duration
                 for event in normalized:
-                    delay = float(event["t"]) - previous_time
-                    if not self._wait(max(0.0, delay)):
+                    event_time = max(previous_time, float(event["t"]))
+                    deadline = playback_started + (
+                        repeat_offset + event_time
+                    ) / self.speed
+                    if not self._wait_until(deadline):
                         return
-                    previous_time = float(event["t"])
+                    previous_time = event_time
                     self._execute_recorded_event(event)
                 repeat_index += 1
-                if repeats is None and self.stop_event.wait(0.001):
+                if (
+                    repeats is None
+                    and recording_duration <= 0
+                    and self.stop_event.wait(0.001)
+                ):
                     return
 
         self._run(task)

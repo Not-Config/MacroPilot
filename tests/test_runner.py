@@ -492,6 +492,98 @@ class AutomationRunnerTests(unittest.TestCase):
         recorder._on_raw_mouse_move(20, 10)
         self.assertEqual(recorder.snapshot(), [])
 
+    def test_recording_playback_does_not_accumulate_event_overhead(self) -> None:
+        clock = [100.0]
+        executed_at = []
+        finished = []
+        runner = main.AutomationRunner(
+            speed=1,
+            on_progress=lambda _text: None,
+            on_finished=lambda stopped, error: finished.append((stopped, error)),
+        )
+
+        def wait(seconds):
+            clock[0] += max(0.0, seconds)
+            return False
+
+        def execute(_event):
+            executed_at.append(clock[0])
+            # Emulate time spent inside SendInput/controller calls. A relative
+            # scheduler would incorrectly add this cost to every next event.
+            clock[0] += 0.2
+
+        runner.stop_event.wait = wait
+        runner._execute_recorded_event = execute
+        events = [
+            {"t": 0.0, "type": "mouse_move", "x": 0, "y": 0},
+            {"t": 1.0, "type": "mouse_move", "x": 1, "y": 0},
+            {"t": 2.0, "type": "mouse_move", "x": 2, "y": 0},
+        ]
+
+        with mock.patch("main.time.perf_counter", side_effect=lambda: clock[0]):
+            runner.run_recording(events, repeats=1)
+
+        self.assertEqual(executed_at, [100.0, 101.0, 102.0])
+        self.assertEqual(finished, [(False, None)])
+
+    def test_absolute_recording_timeline_applies_speed_and_repeats(self) -> None:
+        clock = [100.0]
+        executed_at = []
+        runner = main.AutomationRunner(
+            speed=2,
+            on_progress=lambda _text: None,
+            on_finished=lambda _stopped, _error: None,
+        )
+
+        def wait(seconds):
+            clock[0] += max(0.0, seconds)
+            return False
+
+        def execute(_event):
+            executed_at.append(clock[0])
+            clock[0] += 0.2
+
+        runner.stop_event.wait = wait
+        runner._execute_recorded_event = execute
+        events = [
+            {"t": 2.0, "type": "mouse_move", "x": 1, "y": 0},
+            {"t": 4.0, "type": "mouse_move", "x": 2, "y": 0},
+        ]
+
+        with mock.patch("main.time.perf_counter", side_effect=lambda: clock[0]):
+            runner.run_recording(events, repeats=2)
+
+        self.assertEqual(executed_at, [101.0, 102.0, 103.0, 104.0])
+
+    def test_500_second_recording_stays_on_its_original_deadline(self) -> None:
+        clock = [20.0]
+        last_execution = [None]
+        runner = main.AutomationRunner(
+            speed=1,
+            on_progress=lambda _text: None,
+            on_finished=lambda _stopped, _error: None,
+        )
+
+        def wait(seconds):
+            clock[0] += max(0.0, seconds)
+            return False
+
+        def execute(_event):
+            last_execution[0] = clock[0]
+            clock[0] += 0.003
+
+        runner.stop_event.wait = wait
+        runner._execute_recorded_event = execute
+        events = [
+            {"t": float(second), "type": "mouse_move", "x": second, "y": 0}
+            for second in range(501)
+        ]
+
+        with mock.patch("main.time.perf_counter", side_effect=lambda: clock[0]):
+            runner.run_recording(events, repeats=1)
+
+        self.assertAlmostEqual(last_execution[0], 520.0, places=9)
+
     def test_replays_recorded_drag_in_order(self) -> None:
         finished = []
         runner = main.AutomationRunner(
