@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import ctypes
 import sys
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 
 WINDOWS_NATIVE_AVAILABLE = sys.platform == "win32"
@@ -13,6 +14,9 @@ WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
 WM_SYSKEYDOWN = 0x0104
 WM_SYSKEYUP = 0x0105
+WM_INPUT = 0x00FF
+WM_CLOSE = 0x0010
+WM_DESTROY = 0x0002
 KEYDOWN_MESSAGES = {WM_KEYDOWN, WM_SYSKEYDOWN}
 KEYUP_MESSAGES = {WM_KEYUP, WM_SYSKEYUP}
 
@@ -42,6 +46,16 @@ MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_ABSOLUTE = 0x8000
 WHEEL_DELTA = 120
+
+RID_INPUT = 0x10000003
+RIM_TYPEMOUSE = 0
+RIDEV_REMOVE = 0x00000001
+RIDEV_INPUTSINK = 0x00000100
+MOUSE_MOVE_ABSOLUTE = 0x0001
+HID_USAGE_PAGE_GENERIC = 0x01
+HID_USAGE_GENERIC_MOUSE = 0x02
+HWND_MESSAGE = -3
+UINT_ERROR = 0xFFFFFFFF
 
 SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
@@ -97,6 +111,85 @@ class INPUTUNION(ctypes.Union):
 class INPUT(ctypes.Structure):
     _anonymous_ = ("value",)
     _fields_ = (("type", wintypes.DWORD), ("value", INPUTUNION))
+
+
+class RAWINPUTDEVICE(ctypes.Structure):
+    _fields_ = (
+        ("usUsagePage", ctypes.c_uint16),
+        ("usUsage", ctypes.c_uint16),
+        ("dwFlags", ctypes.c_uint32),
+        ("hwndTarget", ctypes.c_void_p),
+    )
+
+
+class RAWINPUTHEADER(ctypes.Structure):
+    _fields_ = (
+        ("dwType", ctypes.c_uint32),
+        ("dwSize", ctypes.c_uint32),
+        ("hDevice", ctypes.c_void_p),
+        ("wParam", ctypes.c_size_t),
+    )
+
+
+class _RAWMOUSEBUTTONDATA(ctypes.Structure):
+    _fields_ = (
+        ("usButtonFlags", ctypes.c_uint16),
+        ("usButtonData", ctypes.c_uint16),
+    )
+
+
+class _RAWMOUSEBUTTONS(ctypes.Union):
+    _anonymous_ = ("data",)
+    _fields_ = (
+        ("ulButtons", ctypes.c_uint32),
+        ("data", _RAWMOUSEBUTTONDATA),
+    )
+
+
+class RAWMOUSE(ctypes.Structure):
+    _anonymous_ = ("buttons",)
+    _fields_ = (
+        ("usFlags", ctypes.c_uint16),
+        ("buttons", _RAWMOUSEBUTTONS),
+        ("ulRawButtons", ctypes.c_uint32),
+        ("lLastX", ctypes.c_int32),
+        ("lLastY", ctypes.c_int32),
+        ("ulExtraInformation", ctypes.c_uint32),
+    )
+
+
+class _RAWINPUTDATA(ctypes.Union):
+    _fields_ = (("mouse", RAWMOUSE),)
+
+
+class RAWINPUT(ctypes.Structure):
+    _anonymous_ = ("data",)
+    _fields_ = (("header", RAWINPUTHEADER), ("data", _RAWINPUTDATA))
+
+
+_window_function_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
+WNDPROC = _window_function_type(
+    ctypes.c_ssize_t,
+    ctypes.c_void_p,
+    ctypes.c_uint32,
+    ctypes.c_size_t,
+    ctypes.c_ssize_t,
+)
+
+
+class WNDCLASSW(ctypes.Structure):
+    _fields_ = (
+        ("style", ctypes.c_uint32),
+        ("lpfnWndProc", WNDPROC),
+        ("cbClsExtra", ctypes.c_int32),
+        ("cbWndExtra", ctypes.c_int32),
+        ("hInstance", ctypes.c_void_p),
+        ("hIcon", ctypes.c_void_p),
+        ("hCursor", ctypes.c_void_p),
+        ("hbrBackground", ctypes.c_void_p),
+        ("lpszMenuName", ctypes.c_wchar_p),
+        ("lpszClassName", ctypes.c_wchar_p),
+    )
 
 
 def _bind_private_send_input(user32: Any) -> Any:
@@ -322,6 +415,310 @@ class WindowsKeyboardController:
             unit = int.from_bytes(encoded[offset : offset + 2], "little")
             self._send(0, unit, KEYEVENTF_UNICODE)
             self._send(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+
+
+class WindowsRawMouseListener:
+    """Receive physical relative mouse motion through the Windows Raw Input API."""
+
+    def __init__(
+        self,
+        on_move: Callable[[int, int], None],
+        on_error: Callable[[str], None] | None = None,
+    ) -> None:
+        self.on_move = on_move
+        self.on_error = on_error or (lambda _text: None)
+        self.thread: threading.Thread | None = None
+        self.ready = threading.Event()
+        self.stopped = threading.Event()
+        self.startup_error: Exception | None = None
+        self.hwnd: int | None = None
+        self.class_name = f"MacroPilotRawMouse_{id(self):x}"
+        self._wndproc: Any = None
+        self._user32: Any = None
+        self._kernel32: Any = None
+        self._hinstance: int | None = None
+        self._registered = False
+        self._runtime_error_reported = False
+
+    @staticmethod
+    def _last_error(message: str) -> OSError:
+        error_code = int(getattr(ctypes, "get_last_error", lambda: 0)())
+        return OSError(error_code, message)
+
+    def _bind_api(self) -> None:
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        self._kernel32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
+        self._kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+
+        self._user32.RegisterClassW.argtypes = (ctypes.POINTER(WNDCLASSW),)
+        self._user32.RegisterClassW.restype = ctypes.c_uint16
+        self._user32.UnregisterClassW.argtypes = (ctypes.c_wchar_p, ctypes.c_void_p)
+        self._user32.UnregisterClassW.restype = ctypes.c_int
+        self._user32.CreateWindowExW.argtypes = (
+            ctypes.c_uint32,
+            ctypes.c_wchar_p,
+            ctypes.c_wchar_p,
+            ctypes.c_uint32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+        self._user32.CreateWindowExW.restype = ctypes.c_void_p
+        self._user32.DestroyWindow.argtypes = (ctypes.c_void_p,)
+        self._user32.DestroyWindow.restype = ctypes.c_int
+        self._user32.DefWindowProcW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._user32.DefWindowProcW.restype = ctypes.c_ssize_t
+        self._user32.PostMessageW.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._user32.PostMessageW.restype = ctypes.c_int
+        self._user32.PostQuitMessage.argtypes = (ctypes.c_int32,)
+        self._user32.PostQuitMessage.restype = None
+        self._user32.GetMessageW.argtypes = (
+            ctypes.POINTER(wintypes.MSG),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        )
+        self._user32.GetMessageW.restype = ctypes.c_int
+        self._user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        self._user32.TranslateMessage.restype = ctypes.c_int
+        self._user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        self._user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        self._user32.RegisterRawInputDevices.argtypes = (
+            ctypes.POINTER(RAWINPUTDEVICE),
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        )
+        self._user32.RegisterRawInputDevices.restype = ctypes.c_int
+        self._user32.GetRawInputData.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_uint32,
+        )
+        self._user32.GetRawInputData.restype = ctypes.c_uint32
+
+    def _report_runtime_error(self, exc: Exception) -> None:
+        if self._runtime_error_reported:
+            return
+        self._runtime_error_reported = True
+        self.on_error(f"{exc.__class__.__name__}: {exc}")
+
+    def _dispatch_motion(self, flags: int, dx: int, dy: int) -> None:
+        # SetCursorPos-style recentering does not create relative Raw Input.
+        # Absolute HID devices are ignored because their values are normalized
+        # screen coordinates rather than physical mouse counts.
+        if int(flags) & MOUSE_MOVE_ABSOLUTE:
+            return
+        dx, dy = int(dx), int(dy)
+        if dx or dy:
+            self.on_move(dx, dy)
+
+    def _read_raw_input(self, raw_handle: int) -> None:
+        user32 = self._user32
+        header_size = ctypes.sizeof(RAWINPUTHEADER)
+        data_size = ctypes.c_uint32(0)
+        result = int(
+            user32.GetRawInputData(
+                ctypes.c_void_p(raw_handle),
+                RID_INPUT,
+                None,
+                ctypes.byref(data_size),
+                header_size,
+            )
+        )
+        if result != 0 or data_size.value < ctypes.sizeof(RAWINPUT):
+            raise self._last_error("Windows не вернул размер Raw Input")
+
+        buffer = ctypes.create_string_buffer(data_size.value)
+        copied = int(
+            user32.GetRawInputData(
+                ctypes.c_void_p(raw_handle),
+                RID_INPUT,
+                buffer,
+                ctypes.byref(data_size),
+                header_size,
+            )
+        )
+        if copied == UINT_ERROR or copied < ctypes.sizeof(RAWINPUT):
+            raise self._last_error("Windows не прочитал Raw Input мыши")
+
+        raw = ctypes.cast(buffer, ctypes.POINTER(RAWINPUT)).contents
+        if int(raw.header.dwType) == RIM_TYPEMOUSE:
+            self._dispatch_motion(
+                int(raw.mouse.usFlags),
+                int(raw.mouse.lLastX),
+                int(raw.mouse.lLastY),
+            )
+
+    def _window_proc(
+        self,
+        hwnd: int,
+        message: int,
+        wparam: int,
+        lparam: int,
+    ) -> int:
+        if int(message) == WM_INPUT:
+            try:
+                self._read_raw_input(int(lparam))
+            except Exception as exc:
+                self._report_runtime_error(exc)
+            return int(self._user32.DefWindowProcW(hwnd, message, wparam, lparam))
+        if int(message) == WM_CLOSE:
+            self._user32.DestroyWindow(hwnd)
+            return 0
+        if int(message) == WM_DESTROY:
+            self.hwnd = None
+            self._user32.PostQuitMessage(0)
+            return 0
+        return int(self._user32.DefWindowProcW(hwnd, message, wparam, lparam))
+
+    def _remove_registration(self) -> None:
+        if not self._registered or self._user32 is None:
+            return
+        device = RAWINPUTDEVICE(
+            HID_USAGE_PAGE_GENERIC,
+            HID_USAGE_GENERIC_MOUSE,
+            RIDEV_REMOVE,
+            None,
+        )
+        self._user32.RegisterRawInputDevices(
+            ctypes.byref(device),
+            1,
+            ctypes.sizeof(device),
+        )
+        self._registered = False
+
+    def _thread_main(self) -> None:
+        try:
+            self._bind_api()
+            self._hinstance = int(self._kernel32.GetModuleHandleW(None) or 0)
+            if not self._hinstance:
+                raise self._last_error("Windows не вернул модуль приложения")
+
+            self._wndproc = WNDPROC(self._window_proc)
+            window_class = WNDCLASSW(
+                0,
+                self._wndproc,
+                0,
+                0,
+                ctypes.c_void_p(self._hinstance),
+                None,
+                None,
+                None,
+                None,
+                self.class_name,
+            )
+            if not self._user32.RegisterClassW(ctypes.byref(window_class)):
+                raise self._last_error("Windows не зарегистрировал окно Raw Input")
+
+            hwnd = self._user32.CreateWindowExW(
+                0,
+                self.class_name,
+                "MacroPilot Raw Input",
+                0,
+                0,
+                0,
+                0,
+                0,
+                ctypes.c_void_p(HWND_MESSAGE),
+                None,
+                ctypes.c_void_p(self._hinstance),
+                None,
+            )
+            if not hwnd:
+                raise self._last_error("Windows не создал окно Raw Input")
+            self.hwnd = int(hwnd)
+
+            device = RAWINPUTDEVICE(
+                HID_USAGE_PAGE_GENERIC,
+                HID_USAGE_GENERIC_MOUSE,
+                RIDEV_INPUTSINK,
+                ctypes.c_void_p(self.hwnd),
+            )
+            if not self._user32.RegisterRawInputDevices(
+                ctypes.byref(device),
+                1,
+                ctypes.sizeof(device),
+            ):
+                raise self._last_error("Windows не включил Raw Input мыши")
+            self._registered = True
+            self.ready.set()
+
+            message = wintypes.MSG()
+            while True:
+                result = int(self._user32.GetMessageW(ctypes.byref(message), None, 0, 0))
+                if result == 0:
+                    break
+                if result == -1:
+                    raise self._last_error("Windows прервал цикл Raw Input")
+                self._user32.TranslateMessage(ctypes.byref(message))
+                self._user32.DispatchMessageW(ctypes.byref(message))
+        except Exception as exc:
+            if not self.ready.is_set():
+                self.startup_error = exc
+            else:
+                self._report_runtime_error(exc)
+        finally:
+            self._remove_registration()
+            if self.hwnd and self._user32 is not None:
+                self._user32.DestroyWindow(ctypes.c_void_p(self.hwnd))
+                self.hwnd = None
+            if self._user32 is not None and self._hinstance:
+                self._user32.UnregisterClassW(
+                    self.class_name,
+                    ctypes.c_void_p(self._hinstance),
+                )
+            self.ready.set()
+            self.stopped.set()
+
+    def start(self, timeout: float = 3.0) -> None:
+        if not WINDOWS_NATIVE_AVAILABLE:
+            raise RuntimeError("Windows Raw Input доступен только в Windows")
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.ready.clear()
+        self.stopped.clear()
+        self.startup_error = None
+        self._runtime_error_reported = False
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            name="MacroPilotRawMouse",
+            daemon=True,
+        )
+        self.thread.start()
+        if not self.ready.wait(timeout):
+            self.stop()
+            raise TimeoutError("Windows Raw Input не запустился вовремя")
+        if self.startup_error is not None:
+            raise RuntimeError(f"Raw Input: {self.startup_error}") from self.startup_error
+
+    def stop(self, timeout: float = 3.0) -> None:
+        thread = self.thread
+        if thread is None:
+            return
+        hwnd = self.hwnd
+        if hwnd and self._user32 is not None:
+            self._user32.PostMessageW(ctypes.c_void_p(hwnd), WM_CLOSE, 0, 0)
+        if thread is not threading.current_thread():
+            thread.join(timeout)
 
 
 class WindowsMouseController:

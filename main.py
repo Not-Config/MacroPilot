@@ -54,6 +54,7 @@ from windows_input import (
     ScanKey,
     WindowsKeyboardController,
     WindowsMouseController,
+    WindowsRawMouseListener,
     enable_windows_dpi_awareness,
     get_pressed_scan_keys,
     parse_scan_token,
@@ -80,6 +81,7 @@ RECORDING_PRECISION_OPTIONS = {
     "Максимальная · 200/с": 0.005,
 }
 DEFAULT_RECORDING_PRECISION = "Обычная · 40/с"
+DEFAULT_RECORD_MOUSE_MOVES = True
 DRAG_PRECISION_MULTIPLIER = 0.64
 UI_COLORS = {
     "bg": "#0b1020",
@@ -238,7 +240,12 @@ class EventRecorder:
         self.lock = threading.Lock()
         self.started_at = 0.0
         self.last_move_at = -1.0
+        self.last_relative_move_at = -1.0
+        self.pending_relative_dx = 0
+        self.pending_relative_dy = 0
+        self.pending_relative_at: float | None = None
         self.held_mouse_buttons: set[str] = set()
+        self.relative_mouse_buttons: set[str] = set()
         self.held_keyboard_keys: dict[tuple[Any, ...], dict[str, Any]] = {}
         self.last_mouse_position: tuple[int, int] | None = None
         self.active = False
@@ -255,6 +262,8 @@ class EventRecorder:
         )
         self.mouse_listener: Any = None
         self.keyboard_listener: Any = None
+        self.raw_mouse_listener: WindowsRawMouseListener | None = None
+        self.relative_mouse_enabled = False
 
     def start(self) -> None:
         if keyboard is None or mouse is None:
@@ -273,6 +282,11 @@ class EventRecorder:
                 on_press=self._guard(self._on_key_down),
                 on_release=self._guard(self._on_key_up),
             )
+        if WINDOWS_NATIVE_AVAILABLE:
+            self.raw_mouse_listener = WindowsRawMouseListener(
+                on_move=self._guard(self._on_raw_mouse_move),
+                on_error=self._on_raw_mouse_error,
+            )
         try:
             self.mouse_listener.start()
             self.keyboard_listener.start()
@@ -281,6 +295,18 @@ class EventRecorder:
             # hooks explicitly report that they are ready.
             self.mouse_listener.wait()
             self.keyboard_listener.wait()
+            if self.raw_mouse_listener is not None:
+                try:
+                    self.raw_mouse_listener.start()
+                except Exception as exc:
+                    self.raw_mouse_listener.stop()
+                    self.raw_mouse_listener = None
+                    self.report_warning(
+                        "Raw Input мыши недоступен — перетаскивания будут записаны "
+                        f"по экранным координатам ({exc})"
+                    )
+                else:
+                    self.relative_mouse_enabled = True
             self.started_at = time.perf_counter()
             self.active = True
 
@@ -293,7 +319,13 @@ class EventRecorder:
                         self._record_key_change(self._scan_descriptor(key), True)
         except Exception:
             self.active = False
-            for listener in (self.mouse_listener, self.keyboard_listener):
+            for listener in (
+                self.mouse_listener,
+                self.keyboard_listener,
+                self.raw_mouse_listener,
+            ):
+                if listener is None:
+                    continue
                 try:
                     listener.stop()
                 except Exception:
@@ -319,13 +351,21 @@ class EventRecorder:
     def _format_event_count(value: int) -> str:
         return f"{value:,}".replace(",", " ")
 
-    def _append_locked(self, event: dict[str, Any]) -> tuple[bool, str | None, bool]:
+    def _append_locked(
+        self,
+        event: dict[str, Any],
+        *,
+        timestamp: float | None = None,
+    ) -> tuple[bool, str | None, bool]:
         if not self.active or self.stop_requested.is_set():
             return False, None, False
         if len(self.events) >= self.max_recorded_events:
             return False, None, True
 
-        event["t"] = round(self._timestamp(), 6)
+        event["t"] = round(
+            self._timestamp() if timestamp is None else max(0.0, timestamp),
+            6,
+        )
         self.events.append(event)
         recorded_event_count = len(self.events)
         total_event_count = self.capacity_base_count + recorded_event_count
@@ -401,12 +441,65 @@ class EventRecorder:
                     self.held_keyboard_keys.pop(identity, None)
         self._notify_capacity(warning, limit_reached)
 
+    def _on_raw_mouse_error(self, text: str) -> None:
+        self.relative_mouse_enabled = False
+        self.report_warning(
+            "Raw Input мыши отключён; новые перетаскивания используют экранные "
+            f"координаты ({text})"
+        )
+
+    def _flush_relative_move_locked(
+        self,
+        *,
+        force: bool,
+    ) -> tuple[str | None, bool]:
+        if not (self.pending_relative_dx or self.pending_relative_dy):
+            return None, False
+        now = self._timestamp()
+        if (
+            not force
+            and self.last_relative_move_at >= 0
+            and now - self.last_relative_move_at < self.drag_move_interval
+        ):
+            return None, False
+
+        dx, dy = self.pending_relative_dx, self.pending_relative_dy
+        event_time = self.pending_relative_at
+        self.pending_relative_dx = 0
+        self.pending_relative_dy = 0
+        self.pending_relative_at = None
+        appended, warning, limit_reached = self._append_locked(
+            {"type": "mouse_move_relative", "dx": dx, "dy": dy},
+            timestamp=event_time,
+        )
+        if appended:
+            self.last_relative_move_at = now
+        return warning, limit_reached
+
+    def _on_raw_mouse_move(self, dx: int, dy: int) -> None:
+        if not self.active or self.stop_requested.is_set():
+            return
+        with self.lock:
+            if not self.relative_mouse_buttons:
+                return
+            self.pending_relative_dx += int(dx)
+            self.pending_relative_dy += int(dy)
+            self.pending_relative_at = self._timestamp()
+            warning, limit_reached = self._flush_relative_move_locked(force=False)
+        self._notify_capacity(warning, limit_reached)
+
     def _on_move(self, x: int, y: int, _injected: bool = False) -> None:
         if not self.active or self.stop_requested.is_set():
             return
         with self.lock:
             self.last_mouse_position = (int(x), int(y))
             is_dragging = bool(self.held_mouse_buttons)
+            relative_drag = bool(self.relative_mouse_buttons)
+        if relative_drag:
+            # Physical dx/dy arrives separately through Raw Input. Ignoring
+            # screen positions here also removes the game's SetCursorPos
+            # recenter jumps from the recording.
+            return
         if not self.record_moves and not is_dragging:
             return
         now = self._timestamp()
@@ -429,22 +522,48 @@ class EventRecorder:
         name = getattr(button, "name", None)
         if name not in {"left", "right", "middle"}:
             return
+        notifications: list[tuple[str | None, bool]] = []
         with self.lock:
             self.last_mouse_position = (int(x), int(y))
+            relative = (
+                self.relative_mouse_enabled
+                if pressed
+                else name in self.relative_mouse_buttons
+            )
+            if pressed and relative and not self.relative_mouse_buttons:
+                self.pending_relative_dx = 0
+                self.pending_relative_dy = 0
+                self.pending_relative_at = None
+                self.last_relative_move_at = -1.0
+            if not pressed and relative:
+                notifications.append(self._flush_relative_move_locked(force=True))
+            event = {
+                "type": "mouse_button",
+                "x": int(x),
+                "y": int(y),
+                "button": name,
+                "pressed": bool(pressed),
+            }
+            if relative:
+                event["relative"] = True
             appended, warning, limit_reached = self._append_locked(
-                {
-                    "type": "mouse_button",
-                    "x": int(x),
-                    "y": int(y),
-                    "button": name,
-                    "pressed": bool(pressed),
-                }
+                event
             )
             if appended and pressed:
                 self.held_mouse_buttons.add(name)
+                if relative:
+                    self.relative_mouse_buttons.add(name)
             elif appended:
                 self.held_mouse_buttons.discard(name)
-        self._notify_capacity(warning, limit_reached)
+                self.relative_mouse_buttons.discard(name)
+                if not self.relative_mouse_buttons:
+                    self.pending_relative_dx = 0
+                    self.pending_relative_dy = 0
+                    self.pending_relative_at = None
+                    self.last_relative_move_at = -1.0
+            notifications.append((warning, limit_reached))
+        for warning, limit_reached in notifications:
+            self._notify_capacity(warning, limit_reached)
 
     def _on_scroll(
         self,
@@ -544,6 +663,28 @@ class EventRecorder:
                     0,
                     MAX_EVENTS - self.capacity_base_count - len(self.events),
                 )
+                if (
+                    remaining_slots > 0
+                    and self.relative_mouse_buttons
+                    and (self.pending_relative_dx or self.pending_relative_dy)
+                ):
+                    event_time = (
+                        self.pending_relative_at
+                        if self.pending_relative_at is not None
+                        else release_time
+                    )
+                    self.events.append(
+                        {
+                            "t": round(event_time, 6),
+                            "type": "mouse_move_relative",
+                            "dx": self.pending_relative_dx,
+                            "dy": self.pending_relative_dy,
+                        }
+                    )
+                    remaining_slots -= 1
+                self.pending_relative_dx = 0
+                self.pending_relative_dy = 0
+                self.pending_relative_at = None
                 for descriptor in self.held_keyboard_keys.values():
                     if remaining_slots <= 0:
                         break
@@ -557,25 +698,32 @@ class EventRecorder:
                     for button_name in sorted(self.held_mouse_buttons):
                         if remaining_slots <= 0:
                             break
-                        self.events.append(
-                            {
-                                "t": release_time,
-                                "type": "mouse_button",
-                                "x": x,
-                                "y": y,
-                                "button": button_name,
-                                "pressed": False,
-                            }
-                        )
+                        event = {
+                            "t": release_time,
+                            "type": "mouse_button",
+                            "x": x,
+                            "y": y,
+                            "button": button_name,
+                            "pressed": False,
+                        }
+                        if button_name in self.relative_mouse_buttons:
+                            event["relative"] = True
+                        self.events.append(event)
                         remaining_slots -= 1
                 self.held_mouse_buttons.clear()
+                self.relative_mouse_buttons.clear()
                 self.active = False
-        for listener in (self.mouse_listener, self.keyboard_listener):
+        for listener in (
+            self.mouse_listener,
+            self.keyboard_listener,
+            self.raw_mouse_listener,
+        ):
             if listener is not None:
                 try:
                     listener.stop()
                 except Exception:
                     pass
+        self.relative_mouse_enabled = False
         with self.lock:
             self.events.sort(key=lambda item: item["t"])
             return self.events
@@ -648,6 +796,32 @@ class AutomationRunner:
                 return False
         return False
 
+    def _move_by(self, delta_x: int, delta_y: int, duration: float) -> bool:
+        """Send relative mouse deltas without consulting the screen cursor."""
+
+        scaled_duration = duration / self.speed
+        if scaled_duration <= 0:
+            self.mouse_controller.move(delta_x, delta_y)
+            return not self.stop_event.is_set()
+
+        sent_x = 0
+        sent_y = 0
+        started = time.perf_counter()
+        while not self.stop_event.is_set():
+            progress = min(1.0, (time.perf_counter() - started) / scaled_duration)
+            target_x = round(delta_x * progress)
+            target_y = round(delta_y * progress)
+            step_x = target_x - sent_x
+            step_y = target_y - sent_y
+            if step_x or step_y:
+                self.mouse_controller.move(step_x, step_y)
+                sent_x, sent_y = target_x, target_y
+            if progress >= 1.0:
+                return True
+            if self.stop_event.wait(min(0.016, scaled_duration / 10)):
+                return False
+        return False
+
     def _click(self, button: Any, count: int, interval: float) -> bool:
         for index in range(count):
             if self.stop_event.is_set():
@@ -665,8 +839,14 @@ class AutomationRunner:
         event_type = event["type"]
         if event_type == "mouse_move":
             self.mouse_controller.position = (event["x"], event["y"])
+        elif event_type == "mouse_move_relative":
+            self.mouse_controller.move(event["dx"], event["dy"])
         elif event_type == "mouse_button":
-            self.mouse_controller.position = (event["x"], event["y"])
+            # Relative drags start at the recorded click coordinate, then keep
+            # the actual position produced by dx/dy until release. Moving to
+            # the game's recentered coordinate before UP would undo the drag.
+            if event["pressed"] or not event.get("relative", False):
+                self.mouse_controller.position = (event["x"], event["y"])
             button = resolve_button(event["button"])
             if event["pressed"]:
                 self._mouse_down(button)
@@ -729,8 +909,7 @@ class AutomationRunner:
         if name == "MOVE":
             return self._move(args[0], args[1], args[2])
         if name == "MOVE_BY":
-            x, y = self.mouse_controller.position
-            return self._move(int(x) + args[0], int(y) + args[1], args[2])
+            return self._move_by(args[0], args[1], args[2])
         if name == "CLICK":
             return self._click(resolve_button(args[0]), args[1], args[2])
         if name == "CLICK_AT":
@@ -854,7 +1033,7 @@ class MacroPilotApp:
         self.speed_var = tk.StringVar(value="1.0")
         self.repeats_var = tk.StringVar(value="1")
         self.infinite_repeats_var = tk.BooleanVar(value=False)
-        self.record_moves_var = tk.BooleanVar(value=False)
+        self.record_moves_var = tk.BooleanVar(value=DEFAULT_RECORD_MOUSE_MOVES)
         self.recording_precision_var = tk.StringVar(value=DEFAULT_RECORDING_PRECISION)
         self.minimize_var = tk.BooleanVar(value=DEFAULT_MINIMIZE_ACTION_WINDOW)
         self.update_state_var = tk.StringVar(value="Обновления через GitHub Releases")

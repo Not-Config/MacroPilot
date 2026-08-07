@@ -186,6 +186,39 @@ class MacroFormatTests(unittest.TestCase):
         self.assertIn("KEY_UP scan:e0-4d", script)
         self.assertEqual(parse_script(script).estimated_steps, 4)
 
+    def test_relative_mouse_drag_survives_validation_and_becomes_move_by(self) -> None:
+        events = [
+            {
+                "t": 0.0,
+                "type": "mouse_button",
+                "x": 500,
+                "y": 400,
+                "button": "right",
+                "pressed": True,
+                "relative": True,
+            },
+            {"t": 0.1, "type": "mouse_move_relative", "dx": 12, "dy": -7},
+            {
+                "t": 0.2,
+                "type": "mouse_button",
+                "x": 500,
+                "y": 400,
+                "button": "right",
+                "pressed": False,
+                "relative": True,
+            },
+        ]
+
+        normalized = validate_events(events)
+        script = events_to_script(normalized)
+
+        self.assertTrue(normalized[0]["relative"])
+        self.assertEqual((normalized[1]["dx"], normalized[1]["dy"]), (12, -7))
+        self.assertEqual(script.count("MOVE 500 400"), 1)
+        self.assertIn("DOWN right", script)
+        self.assertIn("MOVE_BY 12 -7", script)
+        self.assertIn("UP right", script)
+
     def test_keyboard_autorepeat_is_compacted_without_shortening_hold(self) -> None:
         key = {"kind": "scan", "value": 0x20, "vk": 0x44, "extended": False}
         events = [

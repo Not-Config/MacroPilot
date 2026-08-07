@@ -32,6 +32,10 @@ class FakeMouseController:
     def scroll(self, dx, dy):
         self.log.append(("scroll", dx, dy))
 
+    def move(self, dx, dy):
+        self._position = (self._position[0] + dx, self._position[1] + dy)
+        self.log.append(("move_by", (dx, dy)))
+
 
 class FakeKeyboardController:
     def __init__(self) -> None:
@@ -324,6 +328,49 @@ class AutomationRunnerTests(unittest.TestCase):
                 self.assertFalse(events[2]["pressed"])
                 self.assertEqual(recorder.held_mouse_buttons, set())
 
+    def test_raw_mouse_drag_records_relative_motion_without_recenter_jump(self) -> None:
+        recorder = main.EventRecorder(True, lambda _reason: None, lambda _error: None)
+        recorder.active = True
+        recorder.relative_mouse_enabled = True
+        clock = [0.0]
+        recorder._timestamp = lambda: clock[0]
+        button = types.SimpleNamespace(name="right")
+
+        recorder._on_click(500, 400, button, True, False)
+        clock[0] = 0.01
+        recorder._on_raw_mouse_move(8, -3)
+        # The low-level hook also sees the game's absolute recenter, but it is
+        # deliberately ignored while this Raw Input drag is active.
+        recorder._on_move(500, 400, False)
+        clock[0] = 0.02
+        recorder._on_raw_mouse_move(4, 2)
+        clock[0] = 0.03
+        recorder._on_click(500, 400, button, False, False)
+
+        events = recorder.snapshot()
+        self.assertEqual(
+            [event["type"] for event in events],
+            [
+                "mouse_button",
+                "mouse_move_relative",
+                "mouse_move_relative",
+                "mouse_button",
+            ],
+        )
+        self.assertTrue(events[0]["relative"])
+        self.assertEqual((events[1]["dx"], events[1]["dy"]), (8, -3))
+        self.assertEqual((events[2]["dx"], events[2]["dy"]), (4, 2))
+        self.assertEqual(events[2]["t"], 0.02)
+        self.assertTrue(events[3]["relative"])
+        self.assertEqual(recorder.relative_mouse_buttons, set())
+
+    def test_raw_mouse_motion_is_ignored_until_a_button_is_held(self) -> None:
+        recorder = main.EventRecorder(True, lambda _reason: None, lambda _error: None)
+        recorder.active = True
+        recorder.relative_mouse_enabled = True
+        recorder._on_raw_mouse_move(20, 10)
+        self.assertEqual(recorder.snapshot(), [])
+
     def test_replays_recorded_drag_in_order(self) -> None:
         finished = []
         runner = main.AutomationRunner(
@@ -350,6 +397,64 @@ class AutomationRunnerTests(unittest.TestCase):
                 ("release", "mouse:left"),
             ],
         )
+
+    def test_replays_raw_drag_as_relative_sendinput_motion(self) -> None:
+        finished = []
+        runner = main.AutomationRunner(
+            speed=100,
+            on_progress=lambda _text: None,
+            on_finished=lambda stopped, error: finished.append((stopped, error)),
+        )
+        runner.run_recording(
+            [
+                {
+                    "t": 0.0,
+                    "type": "mouse_button",
+                    "x": 500,
+                    "y": 400,
+                    "button": "right",
+                    "pressed": True,
+                    "relative": True,
+                },
+                {"t": 0.1, "type": "mouse_move_relative", "dx": 15, "dy": -6},
+                {
+                    "t": 0.2,
+                    "type": "mouse_button",
+                    "x": 500,
+                    "y": 400,
+                    "button": "right",
+                    "pressed": False,
+                    "relative": True,
+                },
+            ],
+            repeats=1,
+        )
+        self.assertEqual(finished, [(False, None)])
+        self.assertEqual(
+            self.mouse_controller.log,
+            [
+                ("move", (500, 400)),
+                ("press", "mouse:right"),
+                ("move_by", (15, -6)),
+                ("release", "mouse:right"),
+            ],
+        )
+
+    def test_script_move_by_uses_relative_controller_motion(self) -> None:
+        finished = []
+        runner = main.AutomationRunner(
+            speed=1,
+            on_progress=lambda _text: None,
+            on_finished=lambda stopped, error: finished.append((stopped, error)),
+        )
+
+        runner.run_script(parse_script("MOVE_BY 15 -6").nodes)
+
+        self.assertEqual(finished, [(False, None)])
+        self.assertEqual(self.mouse_controller.log, [("move_by", (15, -6))])
+
+    def test_mouse_movements_are_recorded_by_default(self) -> None:
+        self.assertTrue(main.DEFAULT_RECORD_MOUSE_MOVES)
 
     def test_windows_playback_selects_native_mouse_controller(self) -> None:
         original_available = main.WINDOWS_NATIVE_AVAILABLE

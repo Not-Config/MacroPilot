@@ -13,7 +13,7 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "1.6.1"
+APP_VERSION = "1.7.0"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
 MAX_MACRO_BYTES = 128 * 1024 * 1024
@@ -28,6 +28,7 @@ MAX_NESTING = 20
 BUTTONS = {"left", "right", "middle"}
 EVENT_TYPES = {
     "mouse_move",
+    "mouse_move_relative",
     "mouse_button",
     "mouse_scroll",
     "key_down",
@@ -351,6 +352,11 @@ def validate_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
                 x=_json_int(event.get("x"), f"{label}.x"),
                 y=_json_int(event.get("y"), f"{label}.y"),
             )
+        elif event_type == "mouse_move_relative":
+            item.update(
+                dx=_json_int(event.get("dx"), f"{label}.dx"),
+                dy=_json_int(event.get("dy"), f"{label}.dy"),
+            )
         elif event_type == "mouse_button":
             button = event.get("button")
             if button not in BUTTONS:
@@ -358,12 +364,17 @@ def validate_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             pressed = event.get("pressed")
             if not isinstance(pressed, bool):
                 raise MacroFormatError(f"{label}.pressed: требуется true или false")
+            relative = event.get("relative", False)
+            if not isinstance(relative, bool):
+                raise MacroFormatError(f"{label}.relative: требуется true или false")
             item.update(
                 x=_json_int(event.get("x"), f"{label}.x"),
                 y=_json_int(event.get("y"), f"{label}.y"),
                 button=button,
                 pressed=pressed,
             )
+            if relative:
+                item["relative"] = True
         elif event_type == "mouse_scroll":
             item.update(
                 x=_json_int(event.get("x"), f"{label}.x"),
@@ -466,9 +477,15 @@ def describe_event(event: dict[str, Any]) -> tuple[str, str]:
     event_type = event["type"]
     if event_type == "mouse_move":
         return "Движение мыши", f"x={event['x']}, y={event['y']}"
+    if event_type == "mouse_move_relative":
+        return "Игровое движение мыши", f"dx={event['dx']}, dy={event['dy']}"
     if event_type == "mouse_button":
         action = "нажата" if event["pressed"] else "отпущена"
-        return "Кнопка мыши", f"{event['button']}, {action}, x={event['x']}, y={event['y']}"
+        mode = ", Raw Input" if event.get("relative") else ""
+        return (
+            "Кнопка мыши",
+            f"{event['button']}, {action}, x={event['x']}, y={event['y']}{mode}",
+        )
     if event_type == "mouse_scroll":
         return "Прокрутка", f"dx={event['dx']}, dy={event['dy']}, x={event['x']}, y={event['y']}"
     action = "Клавиша нажата" if event_type == "key_down" else "Клавиша отпущена"
@@ -516,8 +533,11 @@ def events_to_script(events: Iterable[dict[str, Any]]) -> str:
         event_type = event["type"]
         if event_type == "mouse_move":
             lines.append(f"MOVE {event['x']} {event['y']}")
+        elif event_type == "mouse_move_relative":
+            lines.append(f"MOVE_BY {event['dx']} {event['dy']}")
         elif event_type == "mouse_button":
-            lines.append(f"MOVE {event['x']} {event['y']}")
+            if event["pressed"] or not event.get("relative", False):
+                lines.append(f"MOVE {event['x']} {event['y']}")
             action = "DOWN" if event["pressed"] else "UP"
             lines.append(f"{action} {event['button']}")
         elif event_type == "mouse_scroll":

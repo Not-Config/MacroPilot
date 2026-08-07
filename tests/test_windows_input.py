@@ -14,15 +14,22 @@ from windows_input import (
     MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP,
+    MOUSE_MOVE_ABSOLUTE,
     MOUSEEVENTF_MOVE,
     MOUSEEVENTF_MOVE_NOCOALESCE,
     MOUSEEVENTF_RIGHTDOWN,
     MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL,
+    RAWINPUT,
+    RAWINPUTDEVICE,
+    RAWINPUTHEADER,
+    RAWMOUSE,
     ScanKey,
     WindowsKeyboardController,
     WindowsMouseController,
+    WindowsRawMouseListener,
+    WINDOWS_NATIVE_AVAILABLE,
     get_pressed_scan_keys,
     parse_scan_token,
     scan_token,
@@ -92,6 +99,39 @@ class CharacterKey:
 
 
 class WindowsInputTests(unittest.TestCase):
+    def test_raw_input_structures_match_windows_layout(self):
+        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+        expected_header_size = 24 if pointer_size == 8 else 16
+
+        self.assertEqual(ctypes.sizeof(RAWINPUTDEVICE), 16 if pointer_size == 8 else 12)
+        self.assertEqual(ctypes.sizeof(RAWINPUTHEADER), expected_header_size)
+        self.assertEqual(ctypes.sizeof(RAWMOUSE), 24)
+        self.assertEqual(RAWMOUSE.lLastX.offset, 12)
+        self.assertEqual(RAWMOUSE.lLastY.offset, 16)
+        self.assertEqual(ctypes.sizeof(RAWINPUT), expected_header_size + 24)
+
+    def test_raw_mouse_listener_forwards_only_relative_motion(self):
+        moves = []
+        listener = WindowsRawMouseListener(lambda dx, dy: moves.append((dx, dy)))
+
+        listener._dispatch_motion(0, 7, -4)
+        listener._dispatch_motion(MOUSE_MOVE_ABSOLUTE, 12345, 45678)
+        listener._dispatch_motion(0, 0, 0)
+
+        self.assertEqual(moves, [(7, -4)])
+
+    @unittest.skipUnless(WINDOWS_NATIVE_AVAILABLE, "requires Windows")
+    def test_raw_mouse_listener_window_lifecycle(self):
+        listener = WindowsRawMouseListener(lambda _dx, _dy: None)
+        listener.start()
+        try:
+            self.assertIsNotNone(listener.hwnd)
+            self.assertTrue(listener.thread.is_alive())
+        finally:
+            listener.stop()
+        self.assertTrue(listener.stopped.wait(1))
+        self.assertFalse(listener.thread.is_alive())
+
     def test_scan_token_round_trip(self):
         self.assertEqual(parse_scan_token("scan:11"), ScanKey(0x11, extended=False))
         self.assertEqual(parse_scan_token("scan:e0-4d"), ScanKey(0x4D, extended=True))
