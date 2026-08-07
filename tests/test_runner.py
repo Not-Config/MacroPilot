@@ -180,10 +180,73 @@ class AutomationRunnerTests(unittest.TestCase):
 
         runner.run_script(parse_script("CLICK left 2 0").nodes)
 
-        self.assertTrue(any(seconds >= 0.035 for seconds in waits), waits)
-        self.assertTrue(any(0.015 <= seconds <= 0.025 for seconds in waits), waits)
+        self.assertTrue(any(seconds >= 0.055 for seconds in waits), waits)
+        self.assertTrue(any(0.035 <= seconds <= 0.045 for seconds in waits), waits)
         self.assertEqual(self.mouse_controller.log.count(("press", "mouse:left")), 2)
         self.assertEqual(self.mouse_controller.log.count(("release", "mouse:left")), 2)
+
+    def test_fast_recorded_clicks_expose_each_button_state_to_the_game(self) -> None:
+        clock = [50.0]
+        transitions = []
+        runner = main.AutomationRunner(
+            speed=1,
+            on_progress=lambda _text: None,
+            on_finished=lambda _stopped, _error: None,
+        )
+
+        def wait(seconds):
+            clock[0] += max(0.0, seconds)
+            return False
+
+        self.mouse_controller.press = lambda button: transitions.append(
+            ("down", button, clock[0])
+        )
+        self.mouse_controller.release = lambda button: transitions.append(
+            ("up", button, clock[0])
+        )
+        runner.stop_event.wait = wait
+        events = [
+            {
+                "t": 0.00,
+                "type": "mouse_button",
+                "x": 10,
+                "y": 10,
+                "button": "left",
+                "pressed": True,
+            },
+            {
+                "t": 0.01,
+                "type": "mouse_button",
+                "x": 10,
+                "y": 10,
+                "button": "left",
+                "pressed": False,
+            },
+            {
+                "t": 0.02,
+                "type": "mouse_button",
+                "x": 10,
+                "y": 10,
+                "button": "left",
+                "pressed": True,
+            },
+            {
+                "t": 0.03,
+                "type": "mouse_button",
+                "x": 10,
+                "y": 10,
+                "button": "left",
+                "pressed": False,
+            },
+        ]
+
+        with mock.patch("main.time.perf_counter", side_effect=lambda: clock[0]):
+            runner.run_recording(events, repeats=1)
+
+        self.assertEqual([item[0] for item in transitions], ["down", "up", "down", "up"])
+        self.assertGreaterEqual(transitions[1][2] - transitions[0][2], 0.059999)
+        self.assertGreaterEqual(transitions[2][2] - transitions[1][2], 0.039999)
+        self.assertGreaterEqual(transitions[3][2] - transitions[2][2], 0.059999)
 
     def test_script_editor_shortcuts_use_windows_physical_keycodes(self) -> None:
         generated = []

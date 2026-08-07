@@ -94,8 +94,12 @@ DEFAULT_RECORDING_PRECISION = "Обычная · 40/с"
 DEFAULT_RECORD_MOUSE_MOVES = True
 DEFAULT_BLOCK_PHYSICAL_MOUSE = False
 DRAG_PRECISION_MULTIPLIER = 0.64
-MIN_MOUSE_HOLD_SECONDS = 0.040
-MIN_MOUSE_GAP_SECONDS = 0.020
+# Keep both button states visible long enough for games that sample the mouse
+# only once per rendered frame. The real-time minimum is deliberately not
+# divided by playback speed; the absolute recording timeline catches up after
+# the pulse without accumulating drift.
+MIN_MOUSE_HOLD_SECONDS = 0.060
+MIN_MOUSE_GAP_SECONDS = 0.040
 IMAGE_SEARCH_INTERVAL_SECONDS = 0.20
 TK_CONTROL_MASK = 0x0004
 TK_SHIFT_MASK = 0x0001
