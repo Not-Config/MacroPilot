@@ -14,7 +14,10 @@ from macro_core import (
     APP_NAME,
     APP_VERSION,
     EXAMPLE_SCRIPT,
+    MAX_EVENTS,
+    MAX_RECORDED_EVENTS,
     MacroFormatError,
+    RECORDING_WARNING_EVENTS,
     RepeatBlock,
     ScriptCommand,
     ScriptError,
@@ -44,6 +47,7 @@ from windows_input import (
     KEYDOWN_MESSAGES,
     KEYUP_MESSAGES,
     LLKHF_EXTENDED,
+    VK_F9,
     VK_F10,
     VK_F12,
     WINDOWS_NATIVE_AVAILABLE,
@@ -69,6 +73,14 @@ else:
 
 MAX_TABLE_ROWS = 20_000
 DEFAULT_MINIMIZE_ACTION_WINDOW = True
+RECORDING_PRECISION_OPTIONS = {
+    "Экономная · 20/с": 0.050,
+    "Обычная · 40/с": 0.025,
+    "Высокая · 100/с": 0.010,
+    "Максимальная · 200/с": 0.005,
+}
+DEFAULT_RECORDING_PRECISION = "Обычная · 40/с"
+DRAG_PRECISION_MULTIPLIER = 0.64
 UI_COLORS = {
     "bg": "#0b1020",
     "surface": "#111827",
@@ -120,6 +132,7 @@ Windows: scan:11, scan:e0-4d
 
 # Это комментарий
 
+F9 — начать или продолжить запись
 F12 — остановить выполнение
 F10 — закончить запись
 """
@@ -214,10 +227,13 @@ class EventRecorder:
         record_moves: bool,
         request_stop: Callable[[str], None],
         report_error: Callable[[str], None],
+        report_warning: Callable[[str], None] | None = None,
+        move_interval: float = RECORDING_PRECISION_OPTIONS[DEFAULT_RECORDING_PRECISION],
     ) -> None:
         self.record_moves = record_moves
         self.request_stop = request_stop
         self.report_error = report_error
+        self.report_warning = report_warning or (lambda _text: None)
         self.events: list[dict[str, Any]] = []
         self.lock = threading.Lock()
         self.started_at = 0.0
@@ -228,6 +244,15 @@ class EventRecorder:
         self.active = False
         self.stop_requested = threading.Event()
         self.last_error: str | None = None
+        self.max_recorded_events = MAX_RECORDED_EVENTS
+        self.capacity_base_count = 0
+        self.warning_event_count = RECORDING_WARNING_EVENTS
+        self.capacity_warning_sent = False
+        self.move_interval = max(0.001, float(move_interval))
+        self.drag_move_interval = max(
+            0.001,
+            self.move_interval * DRAG_PRECISION_MULTIPLIER,
+        )
         self.mouse_listener: Any = None
         self.keyboard_listener: Any = None
 
@@ -264,7 +289,7 @@ class EventRecorder:
             # the eventual release and lose the intended hold duration.
             if WINDOWS_NATIVE_AVAILABLE:
                 for key in get_pressed_scan_keys():
-                    if key.vk not in {VK_F10, VK_F12}:
+                    if key.vk not in {VK_F9, VK_F10, VK_F12}:
                         self._record_key_change(self._scan_descriptor(key), True)
         except Exception:
             self.active = False
@@ -290,12 +315,48 @@ class EventRecorder:
     def _timestamp(self) -> float:
         return max(0.0, time.perf_counter() - self.started_at)
 
-    def _append(self, event: dict[str, Any]) -> None:
+    @staticmethod
+    def _format_event_count(value: int) -> str:
+        return f"{value:,}".replace(",", " ")
+
+    def _append_locked(self, event: dict[str, Any]) -> tuple[bool, str | None, bool]:
+        if not self.active or self.stop_requested.is_set():
+            return False, None, False
+        if len(self.events) >= self.max_recorded_events:
+            return False, None, True
+
+        event["t"] = round(self._timestamp(), 6)
+        self.events.append(event)
+        recorded_event_count = len(self.events)
+        total_event_count = self.capacity_base_count + recorded_event_count
+        total_capacity = self.capacity_base_count + self.max_recorded_events
+        warning: str | None = None
+        if not self.capacity_warning_sent and total_event_count >= self.warning_event_count:
+            self.capacity_warning_sent = True
+            percent = min(100, round(total_event_count * 100 / total_capacity))
+            remaining = max(0, total_capacity - total_event_count)
+            warning = (
+                f"Большая запись: {self._format_event_count(total_event_count)} событий "
+                f"({percent}%). Осталось около {self._format_event_count(remaining)}"
+            )
+        return True, warning, recorded_event_count >= self.max_recorded_events
+
+    def _notify_capacity(self, warning: str | None, limit_reached: bool) -> None:
+        if warning is not None:
+            self.report_warning(warning)
+        if limit_reached:
+            limit = self._format_event_count(
+                self.capacity_base_count + self.max_recorded_events
+            )
+            self._signal_stop(
+                f"Запись автоматически остановлена: достигнут безопасный предел {limit} событий"
+            )
+
+    def _append(self, event: dict[str, Any]) -> bool:
         with self.lock:
-            if not self.active or self.stop_requested.is_set():
-                return
-            event["t"] = round(self._timestamp(), 6)
-            self.events.append(event)
+            appended, warning, limit_reached = self._append_locked(event)
+        self._notify_capacity(warning, limit_reached)
+        return appended
 
     @staticmethod
     def _scan_descriptor(key: ScanKey) -> dict[str, Any]:
@@ -324,18 +385,21 @@ class EventRecorder:
             if pressed:
                 if identity in self.held_keyboard_keys:
                     return
-                self.held_keyboard_keys[identity] = descriptor.copy()
             else:
                 if identity not in self.held_keyboard_keys:
                     return
-                self.held_keyboard_keys.pop(identity, None)
-            self.events.append(
+            appended, warning, limit_reached = self._append_locked(
                 {
-                    "t": round(self._timestamp(), 6),
                     "type": "key_down" if pressed else "key_up",
                     "key": descriptor.copy(),
                 }
             )
+            if appended:
+                if pressed:
+                    self.held_keyboard_keys[identity] = descriptor.copy()
+                else:
+                    self.held_keyboard_keys.pop(identity, None)
+        self._notify_capacity(warning, limit_reached)
 
     def _on_move(self, x: int, y: int, _injected: bool = False) -> None:
         if not self.active or self.stop_requested.is_set():
@@ -346,7 +410,7 @@ class EventRecorder:
         if not self.record_moves and not is_dragging:
             return
         now = self._timestamp()
-        minimum_interval = 0.016 if is_dragging else 0.025
+        minimum_interval = self.drag_move_interval if is_dragging else self.move_interval
         if self.last_move_at >= 0 and now - self.last_move_at < minimum_interval:
             return
         self.last_move_at = now
@@ -365,25 +429,22 @@ class EventRecorder:
         name = getattr(button, "name", None)
         if name not in {"left", "right", "middle"}:
             return
-        if pressed:
-            with self.lock:
-                self.last_mouse_position = (int(x), int(y))
+        with self.lock:
+            self.last_mouse_position = (int(x), int(y))
+            appended, warning, limit_reached = self._append_locked(
+                {
+                    "type": "mouse_button",
+                    "x": int(x),
+                    "y": int(y),
+                    "button": name,
+                    "pressed": bool(pressed),
+                }
+            )
+            if appended and pressed:
                 self.held_mouse_buttons.add(name)
-        else:
-            with self.lock:
-                self.last_mouse_position = (int(x), int(y))
-        self._append(
-            {
-                "type": "mouse_button",
-                "x": int(x),
-                "y": int(y),
-                "button": name,
-                "pressed": bool(pressed),
-            }
-        )
-        if not pressed:
-            with self.lock:
+            elif appended:
                 self.held_mouse_buttons.discard(name)
+        self._notify_capacity(warning, limit_reached)
 
     def _on_scroll(
         self,
@@ -415,8 +476,8 @@ class EventRecorder:
             return True
         pressed = message in KEYDOWN_MESSAGES
         vk = int(data.vkCode)
-        if vk in {VK_F10, VK_F12}:
-            if pressed:
+        if vk in {VK_F9, VK_F10, VK_F12}:
+            if pressed and vk in {VK_F10, VK_F12}:
                 self._signal_stop("Запись остановлена горячей клавишей")
             return False
         flags = int(data.flags)
@@ -436,8 +497,9 @@ class EventRecorder:
             return None
         if key is None:
             return None
-        if key in {keyboard.Key.f10, keyboard.Key.f12}:
-            self._signal_stop("Запись остановлена горячей клавишей")
+        if key in {keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f12}:
+            if key in {keyboard.Key.f10, keyboard.Key.f12}:
+                self._signal_stop("Запись остановлена горячей клавишей")
             return False
         self._record_key_change(serialize_key(key), True)
         return None
@@ -447,7 +509,7 @@ class EventRecorder:
             return None
         if key is None:
             return None
-        if key in {keyboard.Key.f10, keyboard.Key.f12}:
+        if key in {keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f12}:
             return False
         self._record_key_change(serialize_key(key), False)
         return None
@@ -461,6 +523,15 @@ class EventRecorder:
         with self.lock:
             return sorted((event.copy() for event in self.events), key=lambda item: item["t"])
 
+    def snapshot_range(self, start: int, stop: int) -> list[dict[str, Any]]:
+        with self.lock:
+            return [event.copy() for event in self.events[start:stop]]
+
+    def recording_stats(self) -> tuple[int, float]:
+        with self.lock:
+            duration = float(self.events[-1]["t"]) if self.events else 0.0
+            return len(self.events), duration
+
     def stop(self) -> list[dict[str, Any]]:
         self.stop_requested.set()
         if self.active:
@@ -469,14 +540,23 @@ class EventRecorder:
             # button is still held.
             release_time = round(self._timestamp(), 6)
             with self.lock:
+                remaining_slots = max(
+                    0,
+                    MAX_EVENTS - self.capacity_base_count - len(self.events),
+                )
                 for descriptor in self.held_keyboard_keys.values():
+                    if remaining_slots <= 0:
+                        break
                     self.events.append(
                         {"t": release_time, "type": "key_up", "key": descriptor.copy()}
                     )
+                    remaining_slots -= 1
                 self.held_keyboard_keys.clear()
                 if self.last_mouse_position is not None:
                     x, y = self.last_mouse_position
                     for button_name in sorted(self.held_mouse_buttons):
+                        if remaining_slots <= 0:
+                            break
                         self.events.append(
                             {
                                 "t": release_time,
@@ -487,6 +567,7 @@ class EventRecorder:
                                 "pressed": False,
                             }
                         )
+                        remaining_slots -= 1
                 self.held_mouse_buttons.clear()
                 self.active = False
         for listener in (self.mouse_listener, self.keyboard_listener):
@@ -495,7 +576,9 @@ class EventRecorder:
                     listener.stop()
                 except Exception:
                     pass
-        return self.snapshot()
+        with self.lock:
+            self.events.sort(key=lambda item: item["t"])
+            return self.events
 
 
 class AutomationRunner:
@@ -755,6 +838,11 @@ class MacroPilotApp:
         self.refresh_job: str | None = None
         self.window_was_minimized = False
         self.minimize_job: str | None = None
+        self.start_hotkey_held = False
+        self.record_prompt_active = False
+        self.recording_append_mode = False
+        self.recording_base_count = 0
+        self.recording_base_duration = 0.0
         self.current_macro_path: Path | None = None
         self.current_script_path: Path | None = None
         self.table_event_count = 0
@@ -767,6 +855,7 @@ class MacroPilotApp:
         self.repeats_var = tk.StringVar(value="1")
         self.infinite_repeats_var = tk.BooleanVar(value=False)
         self.record_moves_var = tk.BooleanVar(value=False)
+        self.recording_precision_var = tk.StringVar(value=DEFAULT_RECORDING_PRECISION)
         self.minimize_var = tk.BooleanVar(value=DEFAULT_MINIMIZE_ACTION_WINDOW)
         self.update_state_var = tk.StringVar(value="Обновления через GitHub Releases")
 
@@ -1045,7 +1134,7 @@ class MacroPilotApp:
         ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel").pack(
             side="left", fill="x", expand=True
         )
-        ttk.Label(status_bar, text="F12 — аварийная остановка", style="Status.TLabel").pack(
+        ttk.Label(status_bar, text="F9 — запись · F12 — стоп", style="Status.TLabel").pack(
             side="right", padx=(8, 10)
         )
 
@@ -1054,7 +1143,7 @@ class MacroPilotApp:
         toolbar.pack(fill="x", pady=(0, 10))
         self.record_button = ttk.Button(
             toolbar,
-            text="●  Начать запись",
+            text="●  Начать / продолжить (F9)",
             command=self.start_recording,
             style="Record.TButton",
         )
@@ -1097,14 +1186,29 @@ class MacroPilotApp:
             style="Card.TLabelframe",
         )
         settings.pack(fill="x", pady=(0, 10))
-        ttk.Checkbutton(settings, text="Записывать движения мыши", variable=self.record_moves_var).pack(side="left")
+        ttk.Checkbutton(
+            settings,
+            text="Записывать движения мыши",
+            variable=self.record_moves_var,
+        ).pack(side="left")
+        ttk.Label(settings, text="Точность:", style="Card.TLabel").pack(
+            side="left", padx=(14, 4)
+        )
+        self.recording_precision_combo = ttk.Combobox(
+            settings,
+            values=tuple(RECORDING_PRECISION_OPTIONS),
+            textvariable=self.recording_precision_var,
+            state="readonly",
+            width=19,
+        )
+        self.recording_precision_combo.pack(side="left")
         ttk.Checkbutton(
             settings,
             text="Сворачивать окно при записи и запуске",
             variable=self.minimize_var,
-        ).pack(side="left", padx=(16, 0))
+        ).pack(side="left", padx=(14, 0))
         ttk.Label(settings, text="Скорость:", style="Card.TLabel").pack(
-            side="left", padx=(24, 4)
+            side="left", padx=(14, 4)
         )
         self.speed_spin = ttk.Spinbox(settings, from_=0.1, to=10.0, increment=0.1, width=6, textvariable=self.speed_var)
         self.speed_spin.pack(side="left")
@@ -1296,7 +1400,7 @@ class MacroPilotApp:
         facts.pack(pady=(0, 20))
         ttk.Label(
             facts,
-            text=f"Автор: {AUTHOR_NAME}  ·  GitHub: {AUTHOR_GITHUB}  ·  Лицензия: уточняется",
+            text=f"Автор: {AUTHOR_NAME}  ·  GitHub: {AUTHOR_GITHUB}  ·  Лицензия: MIT",
             style="CardText.TLabel",
         ).pack()
         ttk.Label(facts, textvariable=self.update_state_var, style="CardText.TLabel").pack(
@@ -1531,14 +1635,25 @@ class MacroPilotApp:
             return
 
         def on_press(key: Any, _injected: bool = False) -> None:
-            if key == keyboard.Key.f12:
+            if key == keyboard.Key.f9:
+                if not self.start_hotkey_held:
+                    self.start_hotkey_held = True
+                    self._ui(self.start_recording)
+            elif key == keyboard.Key.f12:
                 self._ui(self.stop_current)
 
+        def on_release(key: Any, _injected: bool = False) -> None:
+            if key == keyboard.Key.f9:
+                self.start_hotkey_held = False
+
         try:
-            self.safety_listener = keyboard.Listener(on_press=on_press)
+            self.safety_listener = keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release,
+            )
             self.safety_listener.start()
         except Exception as exc:
-            self.status_var.set(f"Не удалось включить глобальную F12: {exc}")
+            self.status_var.set(f"Не удалось включить глобальные F9/F12: {exc}")
 
     def _refresh_controls(self) -> None:
         idle = self.mode == "idle"
@@ -1550,6 +1665,7 @@ class MacroPilotApp:
         self._set_enabled(self.to_script_button, idle and has_events)
         self._set_enabled(self.clear_button, idle and has_events)
         self._set_enabled(self.delete_button, idle and has_events)
+        self._set_enabled(self.recording_precision_combo, idle)
         self._set_enabled(self.speed_spin, idle)
         self._set_enabled(self.repeats_spin, idle and not self.infinite_repeats_var.get())
         self._set_enabled(self.infinite_checkbox, idle)
@@ -1621,16 +1737,61 @@ class MacroPilotApp:
         tick(3)
 
     def start_recording(self) -> None:
+        if self.mode != "idle" or getattr(self, "record_prompt_active", False):
+            return
+
+        append = False
+        if self.events:
+            self.record_prompt_active = True
+            try:
+                choice = messagebox.askyesnocancel(
+                    "В макросе уже есть запись",
+                    f"Текущий макрос содержит {len(self.events)} событий.\n\n"
+                    "Да — продолжить с конца текущей записи.\n"
+                    "Нет — удалить текущую запись и начать заново.\n"
+                    "Отмена — ничего не изменять.",
+                    icon="warning",
+                )
+            finally:
+                self.record_prompt_active = False
+            if choice is None:
+                self.status_var.set(
+                    "Начало записи отменено — текущий макрос сохранён"
+                )
+                return
+            append = bool(choice)
+            if append and len(self.events) >= MAX_RECORDED_EVENTS:
+                messagebox.showwarning(
+                    "Продолжение невозможно",
+                    "Текущая запись уже достигла безопасного предела событий. "
+                    "Сохраните её отдельно или начните новую запись.",
+                )
+                return
+
         # Recording is immediate. A countdown here makes it very easy to press
         # a game movement key too early and lose the beginning of its hold.
-        self._begin_recording()
+        self._begin_recording(append=append)
 
-    def _begin_recording(self) -> None:
+    def _begin_recording(self, append: bool = False) -> None:
+        base_count = len(self.events) if append else 0
+        base_duration = macro_duration(self.events) if append else 0.0
+        available_events = MAX_RECORDED_EVENTS - base_count
+        if available_events <= 0:
+            return
+        precision_name = self.recording_precision_var.get()
+        move_interval = RECORDING_PRECISION_OPTIONS.get(
+            precision_name,
+            RECORDING_PRECISION_OPTIONS[DEFAULT_RECORDING_PRECISION],
+        )
         self.recorder = EventRecorder(
             record_moves=self.record_moves_var.get(),
             request_stop=lambda reason: self._ui(self.finish_recording, reason),
             report_error=lambda text: self._ui(self.status_var.set, f"Ошибка записи: {text}"),
+            report_warning=lambda text: self._ui(self._show_recording_warning, text),
+            move_interval=move_interval,
         )
+        self.recorder.capacity_base_count = base_count
+        self.recorder.max_recorded_events = available_events
         try:
             self.recorder.start()
         except Exception as exc:
@@ -1639,26 +1800,67 @@ class MacroPilotApp:
             self._set_mode("idle", "Запись не запущена")
             messagebox.showerror(APP_NAME, f"Не удалось начать запись:\n{exc}")
             return
-        self.events = []
-        self.current_macro_path = None
-        self._refresh_event_table()
+        self.recording_append_mode = append
+        self.recording_base_count = base_count
+        self.recording_base_duration = base_duration
+        if not append:
+            self.events = []
+            self.current_macro_path = None
+            self._refresh_event_table()
+        action = "Продолжается запись" if append else "Идёт запись"
+        input_mode = " игровых scan-кодов" if WINDOWS_NATIVE_AVAILABLE else ""
         recording_status = (
-            "Идёт запись игровых scan-кодов · F10 или F12 — закончить"
-            if WINDOWS_NATIVE_AVAILABLE
-            else "Идёт запись · F10 или F12 — закончить"
+            f"{action}{input_mode} · {precision_name} · F10 или F12 — закончить"
         )
         self._set_mode("recording", recording_status)
         if self.minimize_var.get():
             self._minimize_for_action()
         self._schedule_recording_refresh()
 
+    def _show_recording_warning(self, text: str) -> None:
+        if self.mode != "recording":
+            return
+        self.status_var.set(text)
+        try:
+            self.root.bell()
+        except tk.TclError:
+            pass
+
     def _schedule_recording_refresh(self) -> None:
         if self.mode != "recording" or self.recorder is None:
             return
-        snapshot = self.recorder.snapshot()
-        self.events = snapshot
-        self._refresh_event_table(full=False)
+        new_event_count, new_duration = self.recorder.recording_stats()
+        preview_space = max(0, MAX_TABLE_ROWS - self.recording_base_count)
+        desired_new_preview = min(new_event_count, preview_space)
+        previewed_new = max(0, len(self.events) - self.recording_base_count)
+        if previewed_new < desired_new_preview:
+            self.events.extend(
+                self.recorder.snapshot_range(previewed_new, desired_new_preview)
+            )
+        total_event_count = self.recording_base_count + new_event_count
+        total_duration = (
+            self.recording_base_duration + new_duration
+            if new_event_count
+            else self.recording_base_duration
+        )
+        self._refresh_event_table(
+            full=False,
+            total_event_count=total_event_count,
+            duration=total_duration,
+        )
         self.refresh_job = self.root.after(350, self._schedule_recording_refresh)
+
+    def _merge_recorded_segment(self, new_events: list[dict[str, Any]]) -> None:
+        if not self.recording_append_mode:
+            self.events = new_events
+            return
+
+        # Remove the lightweight UI preview added while recording, then append
+        # the recorder-owned segment with timestamps shifted to the old end.
+        del self.events[self.recording_base_count :]
+        for event in new_events:
+            event["t"] = round(self.recording_base_duration + float(event["t"]), 6)
+        self.events.extend(new_events)
 
     def finish_recording(self, reason: str = "Запись остановлена") -> None:
         if self.mode != "recording" or self.recorder is None:
@@ -1670,11 +1872,21 @@ class MacroPilotApp:
                 pass
             self.refresh_job = None
         recording_error = self.recorder.last_error
-        self.events = self.recorder.stop()
+        new_events = self.recorder.stop()
+        append_mode = self.recording_append_mode
+        self._merge_recorded_segment(new_events)
         self.recorder = None
+        self.recording_append_mode = False
+        self.recording_base_count = 0
+        self.recording_base_duration = 0.0
         self._restore_window()
         self._refresh_event_table()
-        self._set_mode("idle", f"{reason}. Событий: {len(self.events)}")
+        result = (
+            f"{reason}. Добавлено: {len(new_events)} · всего: {len(self.events)}"
+            if append_mode
+            else f"{reason}. Событий: {len(self.events)}"
+        )
+        self._set_mode("idle", result)
         if recording_error:
             messagebox.showerror(
                 "Ошибка записи",
@@ -1856,8 +2068,17 @@ class MacroPilotApp:
             self.status_var.set("Останавливаю…")
             self.runner.stop()
 
-    def _refresh_event_table(self, full: bool = True) -> None:
+    def _refresh_event_table(
+        self,
+        full: bool = True,
+        total_event_count: int | None = None,
+        duration: float | None = None,
+    ) -> None:
         displayed = self.events[:MAX_TABLE_ROWS]
+        if total_event_count is None:
+            total_event_count = len(self.events)
+        if duration is None:
+            duration = macro_duration(self.events)
         if self.table_event_count > len(displayed):
             full = True
         if full:
@@ -1876,10 +2097,15 @@ class MacroPilotApp:
                 tags=("odd" if index % 2 else "even",),
             )
         self.table_event_count = len(displayed)
-        extra = len(self.events) - len(displayed)
+        extra = max(0, total_event_count - len(displayed))
         suffix = f" · в таблице не показано: {extra}" if extra > 0 else ""
+        capacity_suffix = ""
+        if self.mode == "recording" and self.recorder is not None:
+            percent = min(100, total_event_count * 100 / MAX_RECORDED_EVENTS)
+            capacity_suffix = f" · заполнено: {percent:.1f}%"
         self.summary_var.set(
-            f"Событий: {len(self.events)} · длительность: {macro_duration(self.events):.2f} с{suffix}"
+            f"Событий: {total_event_count} · длительность: "
+            f"{duration:.2f} с{capacity_suffix}{suffix}"
         )
         self._refresh_controls()
 

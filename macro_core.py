@@ -13,11 +13,14 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
-MAX_MACRO_BYTES = 20 * 1024 * 1024
+MAX_MACRO_BYTES = 128 * 1024 * 1024
 MAX_EVENTS = 1_000_000
+RECORDING_RELEASE_RESERVE = 1_024
+MAX_RECORDED_EVENTS = MAX_EVENTS - RECORDING_RELEASE_RESERVE
+RECORDING_WARNING_EVENTS = 800_000
 MAX_SCRIPT_STEPS = 100_000
 MAX_REPEAT = 10_000
 MAX_NESTING = 20
@@ -381,27 +384,30 @@ def compact_repeated_key_events(events: Iterable[dict[str, Any]]) -> list[dict[s
 
     normalized = validate_events(events)
     held: set[tuple[Any, ...]] = set()
-    compacted: list[dict[str, Any]] = []
+    write_index = 0
     for event in normalized:
         event_type = event["type"]
-        if event_type not in {"key_down", "key_up"}:
-            compacted.append(event)
-            continue
+        keep = True
+        if event_type in {"key_down", "key_up"}:
+            key = event["key"]
+            identity = (
+                ("scan", int(key["value"]), bool(key.get("extended", False)))
+                if key["kind"] == "scan"
+                else (str(key["kind"]), key["value"])
+            )
+            if event_type == "key_down":
+                if identity in held:
+                    keep = False
+                else:
+                    held.add(identity)
+            else:
+                held.discard(identity)
+        if keep:
+            normalized[write_index] = event
+            write_index += 1
 
-        key = event["key"]
-        identity = (
-            ("scan", int(key["value"]), bool(key.get("extended", False)))
-            if key["kind"] == "scan"
-            else (str(key["kind"]), key["value"])
-        )
-        if event_type == "key_down":
-            if identity in held:
-                continue
-            held.add(identity)
-        else:
-            held.discard(identity)
-        compacted.append(event)
-    return compacted
+    del normalized[write_index:]
+    return normalized
 
 
 def save_macro(path: str | os.PathLike[str], events: Iterable[dict[str, Any]]) -> None:
@@ -416,10 +422,15 @@ def save_macro(path: str | os.PathLike[str], events: Iterable[dict[str, Any]]) -
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_name(destination.name + ".tmp")
     try:
-        temporary.write_text(
-            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        # Keep the existing JSON schema, but omit formatting whitespace.  A
+        # long mouse recording becomes roughly twice as small while old,
+        # pretty-printed v1 files remain fully compatible with load_macro().
+        with temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            json.dump(document, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.write("\n")
+        if temporary.stat().st_size > MAX_MACRO_BYTES:
+            limit_mb = MAX_MACRO_BYTES // (1024 * 1024)
+            raise MacroFormatError(f"Макрос больше безопасного лимита {limit_mb} МБ")
         os.replace(temporary, destination)
     finally:
         if temporary.exists():
@@ -429,7 +440,8 @@ def save_macro(path: str | os.PathLike[str], events: Iterable[dict[str, Any]]) -
 def load_macro(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
     source = Path(path)
     if source.stat().st_size > MAX_MACRO_BYTES:
-        raise MacroFormatError(f"Файл больше {MAX_MACRO_BYTES // (1024 * 1024)} МБ")
+        limit_mb = MAX_MACRO_BYTES // (1024 * 1024)
+        raise MacroFormatError(f"Файл больше безопасного лимита {limit_mb} МБ")
     try:
         document = json.loads(source.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:

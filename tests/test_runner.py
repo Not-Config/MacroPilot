@@ -2,6 +2,7 @@ import threading
 import time
 import types
 import unittest
+from unittest import mock
 
 import main
 from macro_core import parse_script
@@ -51,6 +52,7 @@ class FakeKey:
     ctrl = "key:ctrl"
     shift = "key:shift"
     space = "key:space"
+    f9 = "key:f9"
     f10 = "key:f10"
     f12 = "key:f12"
 
@@ -232,6 +234,72 @@ class AutomationRunnerTests(unittest.TestCase):
         )
         self.assertEqual(recorder.snapshot()[0]["type"], "mouse_button")
 
+    def test_recording_precision_changes_mouse_sampling_interval(self) -> None:
+        recorder = main.EventRecorder(
+            True,
+            lambda _reason: None,
+            lambda _error: None,
+            move_interval=0.05,
+        )
+        recorder.active = True
+        clock = [0.0]
+        recorder._timestamp = lambda: clock[0]
+
+        for timestamp in (0.0, 0.02, 0.05):
+            clock[0] = timestamp
+            recorder._on_move(round(timestamp * 1000), 0)
+
+        self.assertEqual(
+            [event["x"] for event in recorder.snapshot()],
+            [0, 50],
+        )
+
+    def test_recorder_warns_once_and_stops_at_safe_capacity(self) -> None:
+        stops = []
+        warnings = []
+        recorder = main.EventRecorder(
+            True,
+            stops.append,
+            lambda _error: None,
+            warnings.append,
+        )
+        recorder.active = True
+        recorder.started_at = time.perf_counter()
+        recorder.max_recorded_events = 3
+        recorder.warning_event_count = 2
+
+        for x in range(4):
+            recorder._append({"type": "mouse_move", "x": x, "y": 0})
+
+        self.assertEqual(len(recorder.snapshot()), 3)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("Осталось около 1", warnings[0])
+        self.assertEqual(len(stops), 1)
+        self.assertIn("безопасный предел 3 событий", stops[0])
+        self.assertTrue(recorder.stop_requested.is_set())
+
+    def test_continued_recorder_counts_existing_events_toward_capacity(self) -> None:
+        stops = []
+        warnings = []
+        recorder = main.EventRecorder(
+            True,
+            stops.append,
+            lambda _error: None,
+            warnings.append,
+        )
+        recorder.active = True
+        recorder.started_at = time.perf_counter()
+        recorder.capacity_base_count = 7
+        recorder.max_recorded_events = 3
+        recorder.warning_event_count = 8
+
+        for x in range(3):
+            recorder._append({"type": "mouse_move", "x": x, "y": 0})
+
+        self.assertIn("8 событий", warnings[0])
+        self.assertIn("Осталось около 2", warnings[0])
+        self.assertIn("безопасный предел 10 событий", stops[0])
+
     def test_records_left_and_right_drag_without_general_mouse_moves(self) -> None:
         for button_name in ("left", "right"):
             with self.subTest(button=button_name):
@@ -358,6 +426,12 @@ class AutomationRunnerTests(unittest.TestCase):
             {"kind": "scan", "value": 0x11, "vk": 0x57, "extended": False},
         )
 
+        f9_data = types.SimpleNamespace(vkCode=main.VK_F9, scanCode=0x43, flags=0)
+        self.assertFalse(recorder._on_windows_keyboard_event(WM_KEYDOWN, f9_data))
+        self.assertFalse(recorder._on_windows_keyboard_event(WM_KEYUP, f9_data))
+        self.assertEqual(stops, [])
+        self.assertEqual(len(recorder.snapshot()), 2)
+
         f10_data = types.SimpleNamespace(vkCode=main.VK_F10, scanCode=0x44, flags=0)
         self.assertFalse(recorder._on_windows_keyboard_event(WM_KEYDOWN, f10_data))
         self.assertEqual(stops, ["Запись остановлена горячей клавишей"])
@@ -408,9 +482,88 @@ class AutomationRunnerTests(unittest.TestCase):
     def test_recording_button_starts_without_countdown(self) -> None:
         calls = []
         app = object.__new__(main.MacroPilotApp)
-        app._begin_recording = lambda: calls.append("recording")
+        app.mode = "idle"
+        app.events = []
+        app._begin_recording = lambda append=False: calls.append(append)
         app.start_recording()
-        self.assertEqual(calls, ["recording"])
+        self.assertEqual(calls, [False])
+
+    def test_existing_recording_prompts_to_continue_or_overwrite(self) -> None:
+        for choice, expected_append in ((True, True), (False, False)):
+            with self.subTest(choice=choice):
+                calls = []
+                app = object.__new__(main.MacroPilotApp)
+                app.mode = "idle"
+                app.events = [{"t": 1.0, "type": "mouse_move", "x": 1, "y": 2}]
+                app._begin_recording = lambda append=False: calls.append(append)
+                with mock.patch.object(main.messagebox, "askyesnocancel", return_value=choice):
+                    app.start_recording()
+                self.assertEqual(calls, [expected_append])
+
+    def test_existing_recording_cancel_keeps_macro(self) -> None:
+        statuses = []
+        app = object.__new__(main.MacroPilotApp)
+        app.mode = "idle"
+        app.events = [{"t": 1.0, "type": "mouse_move", "x": 1, "y": 2}]
+        app.status_var = types.SimpleNamespace(set=statuses.append)
+        app._begin_recording = lambda append=False: self.fail("recording must not start")
+
+        with mock.patch.object(main.messagebox, "askyesnocancel", return_value=None):
+            app.start_recording()
+
+        self.assertEqual(len(app.events), 1)
+        self.assertIn("отменено", statuses[0])
+
+    def test_continued_recording_appends_shifted_timestamps(self) -> None:
+        app = object.__new__(main.MacroPilotApp)
+        app.events = [
+            {"t": 1.0, "type": "mouse_move", "x": 1, "y": 1},
+            {"t": 2.0, "type": "mouse_move", "x": 2, "y": 2},
+            {"t": 0.25, "type": "mouse_move", "x": 99, "y": 99},
+        ]
+        app.recording_append_mode = True
+        app.recording_base_count = 2
+        app.recording_base_duration = 2.0
+        new_events = [
+            {"t": 0.25, "type": "mouse_move", "x": 3, "y": 3},
+            {"t": 0.75, "type": "mouse_move", "x": 4, "y": 4},
+        ]
+
+        app._merge_recorded_segment(new_events)
+
+        self.assertEqual(len(app.events), 4)
+        self.assertEqual([event["t"] for event in app.events], [1.0, 2.0, 2.25, 2.75])
+        self.assertEqual([event["x"] for event in app.events[-2:]], [3, 4])
+
+    def test_global_f9_starts_once_per_press_and_f12_stops(self) -> None:
+        callbacks = {}
+        starts = []
+        stops = []
+
+        class FakeListener:
+            def __init__(self, **received):
+                callbacks.update(received)
+
+            def start(self):
+                pass
+
+        main.keyboard = types.SimpleNamespace(Key=FakeKey, Listener=FakeListener)
+        app = object.__new__(main.MacroPilotApp)
+        app.start_hotkey_held = False
+        app.start_recording = lambda: starts.append("start")
+        app.stop_current = lambda: stops.append("stop")
+        app._ui = lambda callback, *args: callback(*args)
+        app.status_var = types.SimpleNamespace(set=lambda _text: None)
+
+        app._start_safety_listener()
+        callbacks["on_press"](FakeKey.f9)
+        callbacks["on_press"](FakeKey.f9)
+        callbacks["on_release"](FakeKey.f9)
+        callbacks["on_press"](FakeKey.f9)
+        callbacks["on_press"](FakeKey.f12)
+
+        self.assertEqual(starts, ["start", "start"])
+        self.assertEqual(stops, ["stop"])
 
     def test_infinite_recording_repeats_until_stop(self) -> None:
         second_click = threading.Event()
