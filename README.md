@@ -116,7 +116,7 @@ END
 
 Запустите `build_windows.bat`. Готовый файл появится по адресу `dist\MacroPilot.exe`. Сборка выполняется на Windows; результат PyInstaller нельзя корректно собрать для Windows из Linux или macOS.
 
-При создании тега вида `v1.5.0` GitHub Actions автоматически запускает тесты, собирает EXE и публикует `MacroPilot-windows.zip` и `MacroPilot-source.zip` в новом релизе.
+После изменения `APP_VERSION` и отправки кода в ветку `main` GitHub Actions проверяет, существует ли релиз этой версии. Для нового номера версия автоматически проходит тесты, получает тег вида `v1.5.0`, Windows EXE и два архива: `MacroPilot-windows.zip` и `MacroPilot-source.zip`. Повторные коммиты с тем же номером второй релиз не создают. Сборку также можно запустить вручную на странице **Actions → Release**.
 
 ## Автор и поддержка
 
