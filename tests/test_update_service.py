@@ -17,6 +17,7 @@ from update_service import (
     fetch_latest_release,
     inspect_update_archive,
     is_newer_version,
+    launch_update_installer,
     parse_version,
 )
 
@@ -210,6 +211,25 @@ class UpdateServiceTests(unittest.TestCase):
         self.assertIn("Get-Process -Id $ProcessId", POWERSHELL_INSTALLER)
         self.assertIn("robocopy.exe", POWERSHELL_INSTALLER)
         self.assertIn("Start-Process", POWERSHELL_INSTALLER)
+
+    def test_installer_resets_inherited_pyinstaller_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "update.zip"
+            archive.write_bytes(b"update")
+            with (
+                mock.patch("update_service.tempfile.gettempdir", return_value=directory),
+                mock.patch("update_service.subprocess.Popen") as popen,
+            ):
+                launch_update_installer(archive, "MacroPilot")
+
+            environment = popen.call_args.kwargs["env"]
+            self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
+            scripts = list(Path(directory).glob("MacroPilot-update-*.ps1"))
+            self.assertEqual(len(scripts), 1)
+            self.assertIn(
+                '$env:PYINSTALLER_RESET_ENVIRONMENT = "1"',
+                scripts[0].read_text(encoding="utf-8-sig"),
+            )
 
 
 if __name__ == "__main__":
