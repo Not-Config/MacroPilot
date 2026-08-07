@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from macro_core import (
+    IfBlock,
     MACRO_FORMAT,
     MacroFormatError,
     RepeatBlock,
@@ -21,6 +22,59 @@ from macro_core import (
 
 
 class ScriptParserTests(unittest.TestCase):
+    def test_parses_ocr_variables_and_if_else(self) -> None:
+        program = parse_script(
+            '''
+            OCR_NUMBER health 120 40 180 50 ru-RU
+            IF_NUMBER health < 30
+                PRESS q
+            ELSE
+                WAIT 0.2
+            END
+            TYPE "HP: ${health}" 0
+            '''
+        )
+
+        self.assertEqual(program.estimated_steps, 4)
+        self.assertEqual(
+            program.nodes[0].args,
+            ("health", 120, 40, 180, 50, "ru-RU"),
+        )
+        self.assertIsInstance(program.nodes[1], IfBlock)
+        condition = program.nodes[1]
+        assert isinstance(condition, IfBlock)
+        self.assertEqual(
+            (condition.value_kind, condition.variable, condition.operator, condition.expected),
+            ("number", "health", "<", 30.0),
+        )
+        self.assertEqual(len(condition.true_body), 1)
+        self.assertEqual(len(condition.false_body), 1)
+
+    def test_parses_text_condition_without_else(self) -> None:
+        program = parse_script(
+            'OCR_TEXT state -100 20 300 80\n'
+            'IF_TEXT state CONTAINS "ready"\n'
+            'CLICK\n'
+            'END'
+        )
+        condition = program.nodes[1]
+        self.assertIsInstance(condition, IfBlock)
+        assert isinstance(condition, IfBlock)
+        self.assertEqual(condition.expected, "ready")
+        self.assertEqual(condition.false_body, [])
+
+    def test_rejects_bad_ocr_region_variable_and_blocks(self) -> None:
+        with self.assertRaisesRegex(ScriptError, "имя переменной"):
+            parse_script("OCR_TEXT 1bad 0 0 100 40")
+        with self.assertRaisesRegex(ScriptError, "ширина OCR"):
+            parse_script("OCR_TEXT value 0 0 0 40")
+        with self.assertRaisesRegex(ScriptError, "ELSE без"):
+            parse_script("ELSE")
+        with self.assertRaisesRegex(ScriptError, "ветка ELSE"):
+            parse_script("IF_NUMBER value > 1\nWAIT 1\nELSE\nEND")
+        with self.assertRaisesRegex(ScriptError, "подстановка переменной"):
+            parse_script('TYPE "${bad"')
+
     def test_parses_commands_and_nested_repeat(self) -> None:
         program = parse_script(
             '''

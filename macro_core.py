@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
 MAX_MACRO_BYTES = 128 * 1024 * 1024
@@ -24,6 +25,13 @@ RECORDING_WARNING_EVENTS = 800_000
 MAX_SCRIPT_STEPS = 100_000
 MAX_REPEAT = 10_000
 MAX_NESTING = 20
+MAX_OCR_REGION_DIMENSION = 16_384
+MAX_OCR_REGION_PIXELS = 16_777_216
+
+VARIABLE_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+VARIABLE_TEMPLATE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,63})\}")
+TEXT_COMPARISON_OPERATORS = {"==", "!=", "CONTAINS", "NOT_CONTAINS"}
+NUMBER_COMPARISON_OPERATORS = {"==", "!=", "<", "<=", ">", ">="}
 
 BUTTONS = {"left", "right", "middle"}
 EVENT_TYPES = {
@@ -63,7 +71,19 @@ class RepeatBlock:
     body: list[ScriptNode] = field(default_factory=list)
 
 
-ScriptNode = ScriptCommand | RepeatBlock
+@dataclass(slots=True)
+class IfBlock:
+    value_kind: str
+    variable: str
+    operator: str
+    expected: str | float
+    line_no: int
+    true_body: list[ScriptNode] = field(default_factory=list)
+    false_body: list[ScriptNode] = field(default_factory=list)
+    else_line_no: int | None = None
+
+
+ScriptNode = ScriptCommand | RepeatBlock | IfBlock
 
 
 @dataclass(slots=True)
@@ -137,6 +157,34 @@ def _image_path(token: str, line_no: int) -> str:
         raise ScriptError(line_no, "путь к изображению не может быть пустым")
     if len(value) > 4_096:
         raise ScriptError(line_no, "путь к изображению слишком длинный")
+    return value
+
+
+def _variable_name(token: str, line_no: int) -> str:
+    value = token.strip()
+    if not VARIABLE_PATTERN.fullmatch(value):
+        raise ScriptError(
+            line_no,
+            "имя переменной: латинская буква или _, затем буквы, цифры и _",
+        )
+    return value
+
+
+def _validate_variable_template(text: str, line_no: int) -> None:
+    without_variables = VARIABLE_TEMPLATE_PATTERN.sub("", text)
+    if "${" in without_variables:
+        raise ScriptError(
+            line_no,
+            "неверная подстановка переменной; используйте ${name}",
+        )
+
+
+def _ocr_language(token: str, line_no: int) -> str:
+    value = token.strip()
+    if not value:
+        raise ScriptError(line_no, "язык OCR не может быть пустым")
+    if len(value) > 64:
+        raise ScriptError(line_no, "язык OCR слишком длинный")
     return value
 
 
@@ -228,6 +276,38 @@ def _parse_command(name: str, args: list[str], line_no: int) -> ScriptCommand:
             line_no,
         )
 
+    if name in {"OCR_TEXT", "OCR_NUMBER"}:
+        _arity(args, line_no, name, {5, 6})
+        width = _bounded_int(
+            args[3],
+            line_no,
+            "ширина OCR-области",
+            1,
+            MAX_OCR_REGION_DIMENSION,
+        )
+        height = _bounded_int(
+            args[4],
+            line_no,
+            "высота OCR-области",
+            1,
+            MAX_OCR_REGION_DIMENSION,
+        )
+        if width * height > MAX_OCR_REGION_PIXELS:
+            raise ScriptError(line_no, "OCR-область содержит слишком много пикселей")
+        language = _ocr_language(args[5], line_no) if len(args) == 6 else "auto"
+        return ScriptCommand(
+            name,
+            (
+                _variable_name(args[0], line_no),
+                _coordinate(args[1], line_no, "X"),
+                _coordinate(args[2], line_no, "Y"),
+                width,
+                height,
+                language,
+            ),
+            line_no,
+        )
+
     if name in {"DOWN", "UP"}:
         _arity(args, line_no, name, {1})
         return ScriptCommand(name, (_button(args[0], line_no),), line_no)
@@ -258,6 +338,7 @@ def _parse_command(name: str, args: list[str], line_no: int) -> ScriptCommand:
         _arity(args, line_no, name, {1, 2})
         if len(args[0]) > 10_000:
             raise ScriptError(line_no, "TYPE: допускается не более 10 000 символов")
+        _validate_variable_template(args[0], line_no)
         interval = _bounded_float(args[1], line_no, "интервал", 0, 60) if len(args) == 2 else 0.03
         return ScriptCommand(name, (args[0], interval), line_no)
 
@@ -269,9 +350,13 @@ def _count_steps(nodes: Iterable[ScriptNode], limit: int = MAX_SCRIPT_STEPS) -> 
     for node in nodes:
         if isinstance(node, ScriptCommand):
             total += 1
-        else:
+        elif isinstance(node, RepeatBlock):
             nested = _count_steps(node.body, limit)
             total += node.count * nested
+        else:
+            true_steps = _count_steps(node.true_body, limit)
+            false_steps = _count_steps(node.false_body, limit)
+            total += 1 + max(true_steps, false_steps)
         if total > limit:
             raise ScriptError(
                 node.line_no,
@@ -285,7 +370,7 @@ def parse_script(text: str) -> ScriptProgram:
 
     root: list[ScriptNode] = []
     bodies: list[list[ScriptNode]] = [root]
-    blocks: list[RepeatBlock] = []
+    blocks: list[RepeatBlock | IfBlock] = []
 
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
         try:
@@ -301,7 +386,7 @@ def parse_script(text: str) -> ScriptProgram:
         if name == "REPEAT":
             _arity(args, line_no, name, {1})
             if len(blocks) >= MAX_NESTING:
-                raise ScriptError(line_no, f"вложенность циклов больше {MAX_NESTING}")
+                raise ScriptError(line_no, f"вложенность блоков больше {MAX_NESTING}")
             block = RepeatBlock(
                 count=_bounded_int(args[0], line_no, "число повторов", 1, MAX_REPEAT),
                 line_no=line_no,
@@ -311,12 +396,61 @@ def parse_script(text: str) -> ScriptProgram:
             bodies.append(block.body)
             continue
 
+        if name in {"IF_TEXT", "IF_NUMBER"}:
+            _arity(args, line_no, name, {3})
+            if len(blocks) >= MAX_NESTING:
+                raise ScriptError(line_no, f"вложенность блоков больше {MAX_NESTING}")
+            value_kind = "text" if name == "IF_TEXT" else "number"
+            operator = args[1].upper()
+            allowed = (
+                TEXT_COMPARISON_OPERATORS
+                if value_kind == "text"
+                else NUMBER_COMPARISON_OPERATORS
+            )
+            if operator not in allowed:
+                variants = ", ".join(sorted(allowed))
+                raise ScriptError(line_no, f"{name}: оператор должен быть {variants}")
+            if value_kind == "text":
+                expected: str | float = args[2]
+                if len(expected) > 10_000:
+                    raise ScriptError(line_no, "IF_TEXT: образец слишком длинный")
+            else:
+                expected = _finite_float(args[2], line_no, "значение сравнения")
+            block = IfBlock(
+                value_kind=value_kind,
+                variable=_variable_name(args[0], line_no),
+                operator=operator,
+                expected=expected,
+                line_no=line_no,
+            )
+            bodies[-1].append(block)
+            blocks.append(block)
+            bodies.append(block.true_body)
+            continue
+
+        if name == "ELSE":
+            _arity(args, line_no, name, {0})
+            if not blocks or not isinstance(blocks[-1], IfBlock):
+                raise ScriptError(line_no, "ELSE без соответствующего IF")
+            block = blocks[-1]
+            if block.else_line_no is not None:
+                raise ScriptError(line_no, "повторный ELSE в одном блоке IF")
+            if not bodies[-1]:
+                raise ScriptError(block.line_no, "ветка IF не может быть пустой")
+            block.else_line_no = line_no
+            bodies[-1] = block.false_body
+            continue
+
         if name == "END":
             _arity(args, line_no, name, {0})
             if not blocks:
-                raise ScriptError(line_no, "END без соответствующего REPEAT")
+                raise ScriptError(line_no, "END без соответствующего REPEAT или IF")
             if not bodies[-1]:
-                raise ScriptError(blocks[-1].line_no, "блок REPEAT не может быть пустым")
+                block = blocks[-1]
+                if isinstance(block, RepeatBlock):
+                    raise ScriptError(block.line_no, "блок REPEAT не может быть пустым")
+                branch = "ELSE" if block.else_line_no is not None else "IF"
+                raise ScriptError(block.line_no, f"ветка {branch} не может быть пустой")
             blocks.pop()
             bodies.pop()
             continue
@@ -324,7 +458,9 @@ def parse_script(text: str) -> ScriptProgram:
         bodies[-1].append(_parse_command(name, args, line_no))
 
     if blocks:
-        raise ScriptError(blocks[-1].line_no, "для REPEAT отсутствует END")
+        block = blocks[-1]
+        block_name = "REPEAT" if isinstance(block, RepeatBlock) else "IF"
+        raise ScriptError(block.line_no, f"для {block_name} отсутствует END")
 
     estimated_steps = _count_steps(root)
     return ScriptProgram(tuple(root), estimated_steps)
@@ -607,6 +743,13 @@ PRESS enter
 
 # Ждать до 30 секунд и кликнуть по центру найденной картинки:
 # CLICK_IMAGE "start-button.png" left 30 0.9
+
+# Кнопка «Выбрать OCR-область…» вставит координаты автоматически.
+# Например, считать число здоровья и нажать Q, если осталось меньше 30:
+# OCR_NUMBER health 100 40 180 50
+# IF_NUMBER health < 30
+#     PRESS q
+# END
 
 REPEAT 3
     MOVE_BY 80 0 0.2

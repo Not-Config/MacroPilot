@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import math
 import platform
+import ctypes
 import sys
 import threading
 import time
 import tkinter as tk
 import webbrowser
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable, Iterable
 
 from image_matcher import ImageMatch, ScreenImageMatcher
@@ -15,6 +17,7 @@ from macro_core import (
     APP_NAME,
     APP_VERSION,
     EXAMPLE_SCRIPT,
+    IfBlock,
     MAX_EVENTS,
     MAX_RECORDED_EVENTS,
     MacroFormatError,
@@ -23,6 +26,8 @@ from macro_core import (
     ScriptCommand,
     ScriptError,
     ScriptNode,
+    VARIABLE_PATTERN,
+    VARIABLE_TEMPLATE_PATTERN,
     compact_repeated_key_events,
     describe_event,
     events_to_script,
@@ -31,6 +36,7 @@ from macro_core import (
     parse_script,
     save_macro,
 )
+from ocr_reader import OcrError, ScreenOcrReader, extract_first_number
 from project_config import AUTHOR_NAME, AUTHOR_GITHUB, PROJECT_REPOSITORY, PROJECT_URL, SUPPORT_URL
 from update_service import (
     ReleaseAsset,
@@ -119,6 +125,8 @@ CLICK [кнопка] [раз] [интервал]
 CLICK_AT x y [кнопка] [раз] [интервал]
 WAIT_IMAGE "файл.png" [тайм-аут] [сходство]
 CLICK_IMAGE "файл.png" [кнопка] [тайм-аут] [сходство]
+OCR_TEXT имя x y ширина высота [язык]
+OCR_NUMBER имя x y ширина высота [язык]
 DOWN кнопка
 UP кнопка
 SCROLL dy
@@ -129,6 +137,13 @@ KEY_DOWN клавиша
 KEY_UP клавиша
 HOTKEY клавиша ...
 TYPE "текст" [интервал]
+
+IF_TEXT имя ==|!=|CONTAINS|NOT_CONTAINS "текст"
+IF_NUMBER имя ==|!=|<|<=|>|>= число
+ELSE
+END
+
+Переменную можно вставить в TYPE: ${имя}
 
 REPEAT число
     команды
@@ -141,6 +156,14 @@ left, right, middle
 Тайм-аут 0 ожидает без ограничения.
 Сходство: от 0.5 до 1; по умолчанию 0.9.
 Относительный путь считается от файла сценария.
+
+OCR И ПЕРЕМЕННЫЕ
+«Выбрать OCR-область…» вставляет координаты.
+OCR_TEXT сохраняет текст, OCR_NUMBER — первое число.
+Язык auto использует языки профиля Windows;
+можно явно указать ru-RU или en-US.
+IF_TEXT не учитывает регистр.
+Результат можно вставить в TYPE: ${имя}
 
 ПРИМЕРЫ КЛАВИШ
 enter, tab, space, esc, backspace,
@@ -761,6 +784,8 @@ class AutomationRunner:
         self.stop_event = threading.Event()
         self.mouse_controller: Any = None
         self.keyboard_controller: Any = None
+        self.ocr_reader: ScreenOcrReader | None = None
+        self.variables: dict[str, str | float] = {}
         self.block_physical_mouse = bool(block_physical_mouse)
         self.mouse_blocker: WindowsPhysicalMouseBlocker | None = None
         self.mouse_blocker_error: str | None = None
@@ -974,10 +999,104 @@ class AutomationRunner:
                     self.on_progress(f"Строка {node.line_no}: цикл {index + 1}/{node.count}")
                     if not self._execute_nodes(node.body):
                         return False
+            elif isinstance(node, IfBlock):
+                self.on_progress(f"Строка {node.line_no}: IF_{node.value_kind.upper()}")
+                branch = node.true_body if self._evaluate_condition(node) else node.false_body
+                if branch and not self._execute_nodes(branch):
+                    return False
             else:
                 self.on_progress(f"Строка {node.line_no}: {node.name}")
                 if not self._execute_command(node):
                     return False
+        return True
+
+    @staticmethod
+    def _format_variable(value: str | float) -> str:
+        if isinstance(value, float):
+            if value.is_integer():
+                return str(int(value))
+            return format(value, ".15g")
+        return value
+
+    def _get_variable(self, name: str, line_no: int) -> str | float:
+        try:
+            return self.variables[name]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"Строка {line_no}: переменная {name!r} ещё не задана"
+            ) from exc
+
+    def _expand_variables(self, text: str, line_no: int) -> str:
+        def replace(match: Any) -> str:
+            name = match.group(1)
+            return self._format_variable(self._get_variable(name, line_no))
+
+        return VARIABLE_TEMPLATE_PATTERN.sub(replace, text)
+
+    def _evaluate_condition(self, block: IfBlock) -> bool:
+        actual = self._get_variable(block.variable, block.line_no)
+        operator = block.operator
+        if block.value_kind == "text":
+            left = self._format_variable(actual).casefold()
+            right = str(block.expected).casefold()
+            if operator == "==":
+                return left == right
+            if operator == "!=":
+                return left != right
+            if operator == "CONTAINS":
+                return right in left
+            if operator == "NOT_CONTAINS":
+                return right not in left
+        else:
+            if isinstance(actual, float):
+                left_number = actual
+            else:
+                try:
+                    left_number = extract_first_number(actual)
+                except OcrError as exc:
+                    raise RuntimeError(
+                        f"Строка {block.line_no}: переменная {block.variable!r} "
+                        f"не содержит число: {exc}"
+                    ) from exc
+            right_number = float(block.expected)
+            if operator == "==":
+                return math.isclose(left_number, right_number, rel_tol=1e-9, abs_tol=1e-9)
+            if operator == "!=":
+                return not math.isclose(
+                    left_number,
+                    right_number,
+                    rel_tol=1e-9,
+                    abs_tol=1e-9,
+                )
+            if operator == "<":
+                return left_number < right_number
+            if operator == "<=":
+                return left_number <= right_number
+            if operator == ">":
+                return left_number > right_number
+            if operator == ">=":
+                return left_number >= right_number
+        raise RuntimeError(
+            f"Строка {block.line_no}: неизвестный оператор {operator!r}"
+        )
+
+    def _read_ocr(self, command: ScriptCommand) -> bool:
+        variable, x, y, width, height, language = command.args
+        if self.ocr_reader is None:
+            self.ocr_reader = ScreenOcrReader()
+        try:
+            text = self.ocr_reader.read_region(x, y, width, height, language)
+            if command.name == "OCR_NUMBER":
+                value: str | float = extract_first_number(text)
+            else:
+                value = text
+        except OcrError as exc:
+            raise RuntimeError(f"Строка {command.line_no}: OCR: {exc}") from exc
+        self.variables[variable] = value
+        preview = self._format_variable(value).replace("\n", " ↵ ")
+        if len(preview) > 100:
+            preview = preview[:97] + "…"
+        self.on_progress(f"Строка {command.line_no}: {variable} = {preview or '∅'}")
         return True
 
     def _execute_command(self, command: ScriptCommand) -> bool:
@@ -1001,6 +1120,8 @@ class AutomationRunner:
                 return False
             self.mouse_controller.position = match.center
             return self._click(resolve_button(args[1]), 1, 0.0)
+        if name in {"OCR_TEXT", "OCR_NUMBER"}:
+            return self._read_ocr(command)
         if name == "DOWN":
             return self._mouse_down(resolve_button(args[0]))
         if name == "UP":
@@ -1036,6 +1157,7 @@ class AutomationRunner:
                     self._key_up(key)
         if name == "TYPE":
             text, interval = args
+            text = self._expand_variables(text, command.line_no)
             for char in text:
                 if self.stop_event.is_set():
                     return False
@@ -1072,6 +1194,7 @@ class AutomationRunner:
 
     def _run(self, task: Callable[[], Any]) -> None:
         error: str | None = None
+        self.variables.clear()
         try:
             if keyboard is None or mouse is None:
                 raise RuntimeError("Библиотека pynput не загружена")
@@ -1092,6 +1215,12 @@ class AutomationRunner:
             error = str(exc) or exc.__class__.__name__
         finally:
             self._release_all()
+            if self.ocr_reader is not None:
+                try:
+                    self.ocr_reader.close()
+                except Exception:
+                    pass
+                self.ocr_reader = None
             if self.mouse_blocker is not None:
                 try:
                     self.mouse_blocker.stop()
@@ -1117,6 +1246,188 @@ class AutomationRunner:
                 except Exception:
                     pass
             self.pressed_keys.clear()
+
+
+class ScreenRegionPicker:
+    """Let the user drag a physical-pixel rectangle across the virtual desktop."""
+
+    def __init__(
+        self,
+        root: tk.Tk,
+        on_selected: Callable[[int, int, int, int], None],
+        on_cancelled: Callable[[str | None], None],
+    ) -> None:
+        self.root = root
+        self.on_selected = on_selected
+        self.on_cancelled = on_cancelled
+        self.previous_state = root.state()
+        self.window: tk.Toplevel | None = None
+        self.canvas: tk.Canvas | None = None
+        self.virtual_left = 0
+        self.virtual_top = 0
+        self.virtual_width = 0
+        self.virtual_height = 0
+        self.start_point: tuple[int, int] | None = None
+        self.rectangle_id: int | None = None
+        self.finished = False
+
+    def start(self) -> None:
+        self.root.withdraw()
+        self.root.after(180, self._show_overlay)
+
+    def _show_overlay(self) -> None:
+        try:
+            import mss
+
+            with mss.mss() as capture:
+                monitor = capture.monitors[0]
+                self.virtual_left = int(monitor["left"])
+                self.virtual_top = int(monitor["top"])
+                self.virtual_width = int(monitor["width"])
+                self.virtual_height = int(monitor["height"])
+            if self.virtual_width <= 0 or self.virtual_height <= 0:
+                raise RuntimeError("Windows вернула неверный размер рабочего стола")
+
+            window = tk.Toplevel(self.root)
+            self.window = window
+            window.overrideredirect(True)
+            window.configure(background="#07101f")
+            window.attributes("-topmost", True)
+            window.attributes("-alpha", 0.42)
+            window.geometry(f"{self.virtual_width}x{self.virtual_height}+0+0")
+            window.update_idletasks()
+
+            if WINDOWS_NATIVE_AVAILABLE:
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                user32.SetWindowPos.argtypes = (
+                    ctypes.c_void_p,
+                    ctypes.c_void_p,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_int,
+                    ctypes.c_uint32,
+                )
+                user32.SetWindowPos.restype = ctypes.c_int
+                if not user32.SetWindowPos(
+                    ctypes.c_void_p(window.winfo_id()),
+                    ctypes.c_void_p(-1),
+                    self.virtual_left,
+                    self.virtual_top,
+                    self.virtual_width,
+                    self.virtual_height,
+                    0x0040,
+                ):
+                    raise RuntimeError("Windows не разместила окно выбора области")
+            else:
+                window.geometry(
+                    f"{self.virtual_width}x{self.virtual_height}"
+                    f"{self.virtual_left:+d}{self.virtual_top:+d}"
+                )
+
+            canvas = tk.Canvas(
+                window,
+                background="#07101f",
+                cursor="crosshair",
+                highlightthickness=0,
+                borderwidth=0,
+            )
+            self.canvas = canvas
+            canvas.pack(fill="both", expand=True)
+            canvas.create_text(
+                self.virtual_width // 2,
+                42,
+                text="Зажмите ЛКМ и обведите область OCR · Esc или ПКМ — отмена",
+                fill="#ffffff",
+                font=("Segoe UI Semibold", 14),
+            )
+            canvas.bind("<ButtonPress-1>", self._on_press)
+            canvas.bind("<B1-Motion>", self._on_drag)
+            canvas.bind("<ButtonRelease-1>", self._on_release)
+            canvas.bind("<ButtonPress-3>", lambda _event: self.cancel())
+            window.bind("<Escape>", lambda _event: self.cancel())
+            window.focus_force()
+        except Exception as exc:
+            self.cancel(f"Не удалось открыть выбор OCR-области: {exc}")
+
+    def _clamp_point(self, x: int, y: int) -> tuple[int, int]:
+        return (
+            min(max(int(x), 0), self.virtual_width - 1),
+            min(max(int(y), 0), self.virtual_height - 1),
+        )
+
+    def _on_press(self, event: Any) -> None:
+        if self.canvas is None:
+            return
+        self.start_point = self._clamp_point(event.x, event.y)
+        if self.rectangle_id is not None:
+            self.canvas.delete(self.rectangle_id)
+        x, y = self.start_point
+        self.rectangle_id = self.canvas.create_rectangle(
+            x,
+            y,
+            x,
+            y,
+            outline=UI_COLORS["accent"],
+            width=3,
+            fill="#284a86",
+            stipple="gray25",
+        )
+
+    def _on_drag(self, event: Any) -> None:
+        if self.canvas is None or self.start_point is None or self.rectangle_id is None:
+            return
+        x, y = self._clamp_point(event.x, event.y)
+        self.canvas.coords(
+            self.rectangle_id,
+            self.start_point[0],
+            self.start_point[1],
+            x,
+            y,
+        )
+
+    def _on_release(self, event: Any) -> None:
+        if self.start_point is None:
+            return
+        end_x, end_y = self._clamp_point(event.x, event.y)
+        left = min(self.start_point[0], end_x)
+        top = min(self.start_point[1], end_y)
+        width = abs(end_x - self.start_point[0]) + 1
+        height = abs(end_y - self.start_point[1]) + 1
+        if width < 4 or height < 4:
+            self.start_point = None
+            if self.canvas is not None and self.rectangle_id is not None:
+                self.canvas.delete(self.rectangle_id)
+                self.rectangle_id = None
+            return
+        self._finish()
+        self.on_selected(
+            self.virtual_left + left,
+            self.virtual_top + top,
+            width,
+            height,
+        )
+
+    def _finish(self) -> None:
+        if self.finished:
+            return
+        self.finished = True
+        if self.window is not None:
+            try:
+                self.window.destroy()
+            except tk.TclError:
+                pass
+            self.window = None
+        self.root.deiconify()
+        if self.previous_state == "zoomed":
+            self.root.state("zoomed")
+        self.root.lift()
+
+    def cancel(self, error: str | None = None) -> None:
+        if self.finished:
+            return
+        self._finish()
+        self.on_cancelled(error)
 
 
 class MacroPilotApp:
@@ -1148,6 +1459,7 @@ class MacroPilotApp:
         self.table_event_count = 0
         self.available_release: ReleaseInfo | None = None
         self.update_busy = False
+        self.region_picker: ScreenRegionPicker | None = None
 
         self.status_var = tk.StringVar(value="Готово")
         self.summary_var = tk.StringVar(value="Событий: 0 · длительность: 0.00 с")
@@ -1637,6 +1949,18 @@ class MacroPilotApp:
             variable=self.block_physical_mouse_var,
         )
         self.script_block_physical_mouse_checkbox.pack(side="left")
+        self.script_ocr_region_button = ttk.Button(
+            script_options,
+            text="▣  Выбрать OCR-область…",
+            command=self.select_ocr_region,
+            style="Ghost.TButton",
+        )
+        self.script_ocr_region_button.pack(side="right")
+        ttk.Label(
+            script_options,
+            text="Текст распознаётся локально средствами Windows",
+            style="CardText.TLabel",
+        ).pack(side="right", padx=(0, 10))
 
         pane = ttk.Panedwindow(self.script_tab, orient="horizontal")
         pane.pack(fill="both", expand=True)
@@ -1733,6 +2057,84 @@ class MacroPilotApp:
             return None
         event.widget.event_generate(action)
         return "break"
+
+    def select_ocr_region(self) -> None:
+        if self.mode != "idle" or self.region_picker is not None:
+            return
+        number_mode = messagebox.askyesnocancel(
+            "OCR-область",
+            "Что нужно считать из области?\n\n"
+            "Да — число\n"
+            "Нет — текст\n"
+            "Отмена — ничего не делать",
+            parent=self.root,
+        )
+        if number_mode is None:
+            return
+        default_name = "number" if number_mode else "text"
+        variable = simpledialog.askstring(
+            "OCR-область",
+            "Имя переменной (латинскими буквами):",
+            initialvalue=default_name,
+            parent=self.root,
+        )
+        if variable is None:
+            return
+        variable = variable.strip()
+        if not VARIABLE_PATTERN.fullmatch(variable):
+            messagebox.showerror(
+                "OCR-область",
+                "Имя должно начинаться с латинской буквы или _. "
+                "Далее разрешены латинские буквы, цифры и _.",
+                parent=self.root,
+            )
+            return
+
+        command_name = "OCR_NUMBER" if number_mode else "OCR_TEXT"
+
+        def selected(x: int, y: int, width: int, height: int) -> None:
+            self.region_picker = None
+            self._insert_ocr_command(
+                command_name,
+                variable,
+                x,
+                y,
+                width,
+                height,
+            )
+
+        def cancelled(error: str | None) -> None:
+            self.region_picker = None
+            if error:
+                self.status_var.set(error)
+                messagebox.showerror("OCR-область", error, parent=self.root)
+            else:
+                self.status_var.set("Выбор OCR-области отменён")
+
+        self.status_var.set("Обведите OCR-область на экране · Esc — отмена")
+        self.region_picker = ScreenRegionPicker(self.root, selected, cancelled)
+        self.region_picker.start()
+
+    def _insert_ocr_command(
+        self,
+        command_name: str,
+        variable: str,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+    ) -> None:
+        before_cursor = self.script_text.get("insert linestart", "insert")
+        indent = before_cursor[: len(before_cursor) - len(before_cursor.lstrip())]
+        prefix = "\n" + indent if before_cursor.strip() else ""
+        command = f"{command_name} {variable} {x} {y} {width} {height}"
+        self.script_text.insert("insert", prefix + command + "\n")
+        self.script_text.see("insert")
+        self.script_text.focus_set()
+        self.status_var.set(
+            f"Вставлено: {command_name} {variable} · "
+            f"область {width}×{height} в ({x}, {y})"
+        )
 
     def _build_about_tab(self) -> None:
         shell = ttk.Frame(self.about_tab, style="App.TFrame")
@@ -2050,6 +2452,10 @@ class MacroPilotApp:
         self._set_enabled(self.script_save_button, idle)
         self._set_enabled(self.script_example_button, idle)
         self._set_enabled(self.script_speed_spin, idle)
+        self._set_enabled(
+            self.script_ocr_region_button,
+            idle and WINDOWS_NATIVE_AVAILABLE,
+        )
         self._set_enabled(
             self.script_block_physical_mouse_checkbox,
             idle and WINDOWS_NATIVE_AVAILABLE,
@@ -2387,6 +2793,9 @@ class MacroPilotApp:
         for node in nodes:
             if isinstance(node, RepeatBlock):
                 self._validate_script_keys(node.body)
+            elif isinstance(node, IfBlock):
+                self._validate_script_keys(node.true_body)
+                self._validate_script_keys(node.false_body)
             elif node.name in {"PRESS", "KEY_DOWN", "KEY_UP", "HOTKEY"}:
                 for token in node.args:
                     try:

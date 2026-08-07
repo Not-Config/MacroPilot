@@ -15,7 +15,7 @@ if not exist ".venv\Scripts\python.exe" (
 call ".venv\Scripts\activate.bat"
 python -m pip install --disable-pip-version-check -r requirements-build.txt
 if errorlevel 1 goto :error
-python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss main.py
+python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss --collect-submodules winrt main.py
 if errorlevel 1 goto :error
 
 echo.

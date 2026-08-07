@@ -239,6 +239,55 @@ class AutomationRunnerTests(unittest.TestCase):
         self.assertIn(("press", "mouse:right"), self.mouse_controller.log)
         self.assertIn(("release", "mouse:right"), self.mouse_controller.log)
 
+    def test_ocr_number_controls_branch_and_expands_variable(self) -> None:
+        calls = []
+        finished = []
+
+        class FakeOcrReader:
+            def read_region(self, x, y, width, height, language):
+                calls.append(("read", x, y, width, height, language))
+                return "HP: 25,5 / 100"
+
+            def close(self):
+                calls.append(("close",))
+
+        runner = main.AutomationRunner(
+            speed=100,
+            on_progress=lambda _text: None,
+            on_finished=lambda stopped, error: finished.append((stopped, error)),
+        )
+        program = parse_script(
+            'OCR_NUMBER health 120 40 180 50 ru-RU\n'
+            'IF_NUMBER health < 30\n'
+            '    TYPE "LOW ${health}" 0\n'
+            'ELSE\n'
+            '    TYPE "OK" 0\n'
+            'END'
+        )
+
+        with mock.patch("main.ScreenOcrReader", FakeOcrReader):
+            runner.run_script(program.nodes)
+
+        typed = "".join(
+            value for action, value in self.keyboard_controller.log if action == "type"
+        )
+        self.assertEqual(typed, "LOW 25.5")
+        self.assertEqual(calls, [("read", 120, 40, 180, 50, "ru-RU"), ("close",)])
+        self.assertEqual(finished, [(False, None)])
+
+    def test_variable_must_be_assigned_before_condition(self) -> None:
+        finished = []
+        runner = main.AutomationRunner(
+            speed=1,
+            on_progress=lambda _text: None,
+            on_finished=lambda stopped, error: finished.append((stopped, error)),
+        )
+
+        runner.run_script(parse_script("IF_NUMBER score > 5\nWAIT 0\nEND").nodes)
+
+        self.assertEqual(finished[0][0], False)
+        self.assertIn("переменная 'score' ещё не задана", finished[0][1])
+
     def test_stop_releases_held_inputs(self) -> None:
         entered_wait = threading.Event()
         finished = []

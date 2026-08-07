@@ -48,7 +48,7 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Build portable Windows folder
         if: steps.release.outputs.exists != 'true'
-        run: python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss main.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss --collect-submodules winrt main.py
       - name: Package release assets
         if: steps.release.outputs.exists != 'true'
         shell: pwsh
