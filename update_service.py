@@ -346,6 +346,7 @@ POWERSHELL_INSTALLER = r'''param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYINSTALLER_RESET_ENVIRONMENT = "1"
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("MacroPilot-stage-" + [guid]::NewGuid())
 $log = Join-Path $InstallPath "update-error.log"
 try {
@@ -410,8 +411,21 @@ def launch_update_installer(archive: Path, payload_subdir: str) -> None:
         launch_argument,
     ]
     creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    environment = os.environ.copy()
+    # PyInstaller 6.9+ treats a process started from the same frozen
+    # executable as a worker of the current one unless this public flag is
+    # set.  The updater deliberately waits for the current one-file process
+    # to exit, so its _MEI directory is gone by the time the replacement is
+    # launched.  Resetting the inherited bootloader state forces a fresh
+    # extraction instead of reusing that removed directory.
+    environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
     try:
-        subprocess.Popen(command, close_fds=True, creationflags=creation_flags)
+        subprocess.Popen(
+            command,
+            close_fds=True,
+            creationflags=creation_flags,
+            env=environment,
+        )
     except OSError as exc:
         try:
             script.unlink()
