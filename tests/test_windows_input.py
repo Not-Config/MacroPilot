@@ -9,6 +9,7 @@ from windows_input import (
     KEYEVENTF_EXTENDEDKEY,
     KEYEVENTF_KEYUP,
     KEYEVENTF_SCANCODE,
+    MACROPILOT_MOUSE_EXTRA_INFO,
     MAPVK_VK_TO_VSC_EX,
     MOUSEEVENTF_ABSOLUTE,
     MOUSEEVENTF_HWHEEL,
@@ -25,9 +26,11 @@ from windows_input import (
     RAWINPUTDEVICE,
     RAWINPUTHEADER,
     RAWMOUSE,
+    MSLLHOOKSTRUCT,
     ScanKey,
     WindowsKeyboardController,
     WindowsMouseController,
+    WindowsPhysicalMouseBlocker,
     WindowsRawMouseListener,
     WINDOWS_NATIVE_AVAILABLE,
     get_pressed_scan_keys,
@@ -39,6 +42,7 @@ from windows_input import (
 class FakeUser32:
     def __init__(self):
         self.sent = []
+        self.mouse_extra_info = []
         self.held = set()
         self.cursor = (120, 240)
         self.metrics = {
@@ -54,6 +58,7 @@ class FakeUser32:
         self.assertions = (count, size)
         payload = ctypes.cast(pointer, ctypes.POINTER(INPUT)).contents
         if int(payload.type) == INPUT_MOUSE:
+            self.mouse_extra_info.append(int(payload.mi.dwExtraInfo))
             self.sent.append(
                 (
                     "mouse",
@@ -99,6 +104,51 @@ class CharacterKey:
 
 
 class WindowsInputTests(unittest.TestCase):
+    def test_low_level_mouse_structure_matches_windows_layout(self):
+        pointer_size = ctypes.sizeof(ctypes.c_void_p)
+        self.assertEqual(ctypes.sizeof(MSLLHOOKSTRUCT), 32 if pointer_size == 8 else 24)
+
+    def test_mouse_blocker_allows_only_macropilot_marker(self):
+        calls = []
+
+        class FakeHookUser32:
+            def CallNextHookEx(self, hook, n_code, wparam, lparam):
+                calls.append((hook.value, n_code, wparam, lparam))
+                return 73
+
+        blocker = WindowsPhysicalMouseBlocker()
+        blocker._user32 = FakeHookUser32()
+        blocker.hook_handle = 91
+        event = MSLLHOOKSTRUCT()
+
+        event.dwExtraInfo = 0
+        self.assertEqual(
+            blocker._hook_callback(0, 0x0200, ctypes.addressof(event)),
+            1,
+        )
+        self.assertEqual(calls, [])
+
+        event.dwExtraInfo = MACROPILOT_MOUSE_EXTRA_INFO
+        self.assertEqual(
+            blocker._hook_callback(0, 0x0200, ctypes.addressof(event)),
+            73,
+        )
+        self.assertEqual(calls[-1][0], 91)
+
+        self.assertEqual(blocker._hook_callback(-1, 0, 0), 73)
+
+    @unittest.skipUnless(WINDOWS_NATIVE_AVAILABLE, "requires Windows")
+    def test_physical_mouse_blocker_hook_lifecycle(self):
+        blocker = WindowsPhysicalMouseBlocker()
+        blocker.start()
+        try:
+            self.assertIsNotNone(blocker.hook_handle)
+            self.assertTrue(blocker.thread.is_alive())
+        finally:
+            blocker.stop()
+        self.assertTrue(blocker.stopped.wait(1))
+        self.assertFalse(blocker.thread.is_alive())
+
     def test_raw_input_structures_match_windows_layout(self):
         pointer_size = ctypes.sizeof(ctypes.c_void_p)
         expected_header_size = 24 if pointer_size == 8 else 16
@@ -214,6 +264,10 @@ class WindowsInputTests(unittest.TestCase):
                 ("mouse", 0, 0, 240, MOUSEEVENTF_HWHEEL),
                 ("mouse", 0, 0, 120, MOUSEEVENTF_WHEEL),
             ],
+        )
+        self.assertEqual(
+            user32.mouse_extra_info,
+            [MACROPILOT_MOUSE_EXTRA_INFO] * 3,
         )
 
     def test_native_mouse_supports_right_button_hold(self):

@@ -17,6 +17,7 @@ WM_SYSKEYUP = 0x0105
 WM_INPUT = 0x00FF
 WM_CLOSE = 0x0010
 WM_DESTROY = 0x0002
+WM_QUIT = 0x0012
 KEYDOWN_MESSAGES = {WM_KEYDOWN, WM_SYSKEYDOWN}
 KEYUP_MESSAGES = {WM_KEYUP, WM_SYSKEYUP}
 
@@ -24,6 +25,13 @@ VK_F9 = 0x78
 VK_F10 = 0x79
 VK_F12 = 0x7B
 LLKHF_EXTENDED = 0x01
+WH_MOUSE_LL = 14
+PM_NOREMOVE = 0x0000
+
+# Every mouse event created by MacroPilot carries this marker in dwExtraInfo.
+# The playback-only low-level hook lets these events through and suppresses
+# unmarked events produced by the physical mouse or other applications.
+MACROPILOT_MOUSE_EXTRA_INFO = 0x4D504C54  # "MPLT"
 
 INPUT_KEYBOARD = 1
 INPUT_MOUSE = 0
@@ -167,11 +175,31 @@ class RAWINPUT(ctypes.Structure):
     _fields_ = (("header", RAWINPUTHEADER), ("data", _RAWINPUTDATA))
 
 
+class _HOOKPOINT(ctypes.Structure):
+    _fields_ = (("x", ctypes.c_int32), ("y", ctypes.c_int32))
+
+
+class MSLLHOOKSTRUCT(ctypes.Structure):
+    _fields_ = (
+        ("pt", _HOOKPOINT),
+        ("mouseData", ctypes.c_uint32),
+        ("flags", ctypes.c_uint32),
+        ("time", ctypes.c_uint32),
+        ("dwExtraInfo", ctypes.c_size_t),
+    )
+
+
 _window_function_type = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 WNDPROC = _window_function_type(
     ctypes.c_ssize_t,
     ctypes.c_void_p,
     ctypes.c_uint32,
+    ctypes.c_size_t,
+    ctypes.c_ssize_t,
+)
+LOW_LEVEL_MOUSE_PROC = _window_function_type(
+    ctypes.c_ssize_t,
+    ctypes.c_int,
     ctypes.c_size_t,
     ctypes.c_ssize_t,
 )
@@ -721,6 +749,221 @@ class WindowsRawMouseListener:
             thread.join(timeout)
 
 
+class WindowsPhysicalMouseBlocker:
+    """Suppress unmarked mouse input while allowing MacroPilot SendInput events."""
+
+    def __init__(self, on_error: Callable[[str], None] | None = None) -> None:
+        self.on_error = on_error or (lambda _text: None)
+        self.thread: threading.Thread | None = None
+        self.ready = threading.Event()
+        self.stopped = threading.Event()
+        self.stop_requested = threading.Event()
+        self.startup_error: Exception | None = None
+        self.thread_id: int | None = None
+        self.hook_handle: int | None = None
+        self._hook_proc: Any = None
+        self._user32: Any = None
+        self._kernel32: Any = None
+        self._runtime_error_reported = False
+
+    @staticmethod
+    def _last_error(message: str) -> OSError:
+        error_code = int(getattr(ctypes, "get_last_error", lambda: 0)())
+        return OSError(error_code, message)
+
+    @staticmethod
+    def should_block(extra_info: int) -> bool:
+        """Return whether a low-level event is not one of MacroPilot's events."""
+
+        return int(extra_info) != MACROPILOT_MOUSE_EXTRA_INFO
+
+    def _bind_api(self) -> None:
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        self._kernel32.GetModuleHandleW.argtypes = (ctypes.c_wchar_p,)
+        self._kernel32.GetModuleHandleW.restype = ctypes.c_void_p
+        self._kernel32.GetCurrentThreadId.argtypes = ()
+        self._kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+        self._user32.SetWindowsHookExW.argtypes = (
+            ctypes.c_int,
+            LOW_LEVEL_MOUSE_PROC,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        self._user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        self._user32.CallNextHookEx.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        self._user32.UnhookWindowsHookEx.argtypes = (ctypes.c_void_p,)
+        self._user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+        self._user32.PeekMessageW.argtypes = (
+            ctypes.POINTER(wintypes.MSG),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        )
+        self._user32.PeekMessageW.restype = wintypes.BOOL
+        self._user32.GetMessageW.argtypes = (
+            ctypes.POINTER(wintypes.MSG),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+        )
+        self._user32.GetMessageW.restype = ctypes.c_int
+        self._user32.TranslateMessage.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        self._user32.TranslateMessage.restype = wintypes.BOOL
+        self._user32.DispatchMessageW.argtypes = (ctypes.POINTER(wintypes.MSG),)
+        self._user32.DispatchMessageW.restype = ctypes.c_ssize_t
+        self._user32.PostThreadMessageW.argtypes = (
+            wintypes.DWORD,
+            ctypes.c_uint32,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._user32.PostThreadMessageW.restype = wintypes.BOOL
+
+    def _call_next(self, n_code: int, wparam: int, lparam: int) -> int:
+        if self._user32 is None:
+            return 0
+        return int(
+            self._user32.CallNextHookEx(
+                ctypes.c_void_p(self.hook_handle or 0),
+                int(n_code),
+                int(wparam),
+                int(lparam),
+            )
+        )
+
+    def _hook_callback(self, n_code: int, wparam: int, lparam: int) -> int:
+        if int(n_code) < 0:
+            return self._call_next(n_code, wparam, lparam)
+        try:
+            event = ctypes.cast(
+                int(lparam),
+                ctypes.POINTER(MSLLHOOKSTRUCT),
+            ).contents
+            if self.should_block(int(event.dwExtraInfo)):
+                return 1
+        except Exception:
+            # A malformed callback must fail open so the user never loses the
+            # mouse because of an unexpected structure or ctypes error.
+            return self._call_next(n_code, wparam, lparam)
+        return self._call_next(n_code, wparam, lparam)
+
+    def _report_runtime_error(self, exc: Exception) -> None:
+        if self._runtime_error_reported:
+            return
+        self._runtime_error_reported = True
+        self.on_error(f"{exc.__class__.__name__}: {exc}")
+
+    def _unhook(self) -> None:
+        handle = self.hook_handle
+        if handle and self._user32 is not None:
+            self._user32.UnhookWindowsHookEx(ctypes.c_void_p(handle))
+            self.hook_handle = None
+
+    def _thread_main(self) -> None:
+        try:
+            self._bind_api()
+            self.thread_id = int(self._kernel32.GetCurrentThreadId())
+
+            # PostThreadMessage works only after the receiving thread owns a
+            # message queue. PeekMessage creates it before start() returns.
+            message = wintypes.MSG()
+            self._user32.PeekMessageW(
+                ctypes.byref(message),
+                None,
+                0,
+                0,
+                PM_NOREMOVE,
+            )
+            if self.stop_requested.is_set():
+                return
+
+            hinstance = self._kernel32.GetModuleHandleW(None)
+            self._hook_proc = LOW_LEVEL_MOUSE_PROC(self._hook_callback)
+            hook = self._user32.SetWindowsHookExW(
+                WH_MOUSE_LL,
+                self._hook_proc,
+                hinstance,
+                0,
+            )
+            if not hook:
+                raise self._last_error("Windows не включил блокировку физической мыши")
+            self.hook_handle = int(hook)
+            self.ready.set()
+
+            if self.stop_requested.is_set():
+                self._user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+
+            while True:
+                result = int(self._user32.GetMessageW(ctypes.byref(message), None, 0, 0))
+                if result == 0:
+                    break
+                if result == -1:
+                    raise self._last_error("Windows прервал блокировку физической мыши")
+                self._user32.TranslateMessage(ctypes.byref(message))
+                self._user32.DispatchMessageW(ctypes.byref(message))
+        except Exception as exc:
+            if not self.ready.is_set():
+                self.startup_error = exc
+            else:
+                self._report_runtime_error(exc)
+        finally:
+            self._unhook()
+            self.ready.set()
+            self.stopped.set()
+
+    def start(self, timeout: float = 3.0) -> None:
+        if not WINDOWS_NATIVE_AVAILABLE:
+            raise RuntimeError("Блокировка физической мыши доступна только в Windows")
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.ready.clear()
+        self.stopped.clear()
+        self.stop_requested.clear()
+        self.startup_error = None
+        self.thread_id = None
+        self.hook_handle = None
+        self._runtime_error_reported = False
+        self.thread = threading.Thread(
+            target=self._thread_main,
+            name="MacroPilotMouseBlocker",
+            daemon=True,
+        )
+        self.thread.start()
+        if not self.ready.wait(timeout):
+            self.stop()
+            raise TimeoutError("Блокировка физической мыши не запустилась вовремя")
+        if self.startup_error is not None:
+            self.stop()
+            raise RuntimeError(
+                f"Блокировка физической мыши: {self.startup_error}"
+            ) from self.startup_error
+
+    def stop(self, timeout: float = 3.0) -> None:
+        self.stop_requested.set()
+        thread = self.thread
+        if thread is None:
+            return
+        if self.thread_id and self._user32 is not None:
+            self._user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
+        if thread is not threading.current_thread():
+            thread.join(timeout)
+        if thread.is_alive():
+            # Even if the message loop is unexpectedly stuck, remove the hook
+            # from this thread so physical input is immediately restored.
+            self._unhook()
+            raise TimeoutError("Windows не остановил блокировку физической мыши")
+
+
 class WindowsMouseController:
     """Mouse sender using real SendInput events for game UI compatibility."""
 
@@ -757,7 +1000,7 @@ class WindowsMouseController:
                     mouseData=ctypes.c_uint32(int(mouse_data)).value,
                     dwFlags=int(flags),
                     time=0,
-                    dwExtraInfo=0,
+                    dwExtraInfo=MACROPILOT_MOUSE_EXTRA_INFO,
                 )
             ),
         )

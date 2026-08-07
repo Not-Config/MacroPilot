@@ -528,6 +528,102 @@ class AutomationRunnerTests(unittest.TestCase):
     def test_mouse_movements_are_recorded_by_default(self) -> None:
         self.assertTrue(main.DEFAULT_RECORD_MOUSE_MOVES)
 
+    def test_physical_mouse_blocking_is_opt_in(self) -> None:
+        self.assertFalse(main.DEFAULT_BLOCK_PHYSICAL_MOUSE)
+
+    def test_physical_mouse_blocker_wraps_playback_and_is_always_stopped(self) -> None:
+        lifecycle = []
+        finished = []
+        mouse_controller = FakeMouseController()
+        original_release = mouse_controller.release
+
+        def tracked_release(button):
+            lifecycle.append(("release", button))
+            original_release(button)
+
+        mouse_controller.release = tracked_release
+
+        class FakeBlocker:
+            def __init__(self, on_error=None):
+                self.on_error = on_error
+
+            def start(self):
+                lifecycle.append("start")
+
+            def stop(self):
+                lifecycle.append("stop")
+
+        with (
+            mock.patch.object(main, "WINDOWS_NATIVE_AVAILABLE", True),
+            mock.patch.object(main, "WindowsMouseController", lambda: mouse_controller),
+            mock.patch.object(
+                main,
+                "WindowsKeyboardController",
+                lambda: self.keyboard_controller,
+            ),
+            mock.patch.object(main, "WindowsPhysicalMouseBlocker", FakeBlocker),
+        ):
+            runner = main.AutomationRunner(
+                speed=100,
+                on_progress=lambda _text: None,
+                on_finished=lambda stopped, error: finished.append((stopped, error)),
+                block_physical_mouse=True,
+            )
+            runner.run_script(parse_script("DOWN left").nodes)
+
+        self.assertEqual(finished, [(False, None)])
+        self.assertEqual(lifecycle[0], "start")
+        self.assertEqual(lifecycle[-1], "stop")
+        self.assertEqual(
+            lifecycle[1:4],
+            [
+                ("release", "mouse:left"),
+                ("release", "mouse:right"),
+                ("release", "mouse:middle"),
+            ],
+        )
+        self.assertEqual(lifecycle[-2], ("release", "mouse:left"))
+
+    def test_mouse_blocker_startup_failure_is_reported_and_cleaned_up(self) -> None:
+        lifecycle = []
+        finished = []
+
+        class FailedBlocker:
+            def __init__(self, on_error=None):
+                self.on_error = on_error
+
+            def start(self):
+                lifecycle.append("start")
+                raise RuntimeError("hook denied")
+
+            def stop(self):
+                lifecycle.append("stop")
+
+        with (
+            mock.patch.object(main, "WINDOWS_NATIVE_AVAILABLE", True),
+            mock.patch.object(
+                main,
+                "WindowsMouseController",
+                lambda: self.mouse_controller,
+            ),
+            mock.patch.object(
+                main,
+                "WindowsKeyboardController",
+                lambda: self.keyboard_controller,
+            ),
+            mock.patch.object(main, "WindowsPhysicalMouseBlocker", FailedBlocker),
+        ):
+            runner = main.AutomationRunner(
+                speed=1,
+                on_progress=lambda _text: None,
+                on_finished=lambda stopped, error: finished.append((stopped, error)),
+                block_physical_mouse=True,
+            )
+            runner.run_script(parse_script("WAIT 0").nodes)
+
+        self.assertEqual(lifecycle, ["start", "stop"])
+        self.assertEqual(finished, [(False, "hook denied")])
+
     def test_windows_playback_selects_native_mouse_controller(self) -> None:
         original_available = main.WINDOWS_NATIVE_AVAILABLE
         original_native_mouse = main.WindowsMouseController

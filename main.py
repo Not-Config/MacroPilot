@@ -57,6 +57,7 @@ from windows_input import (
     ScanKey,
     WindowsKeyboardController,
     WindowsMouseController,
+    WindowsPhysicalMouseBlocker,
     WindowsRawMouseListener,
     enable_windows_dpi_awareness,
     get_pressed_scan_keys,
@@ -85,6 +86,7 @@ RECORDING_PRECISION_OPTIONS = {
 }
 DEFAULT_RECORDING_PRECISION = "Обычная · 40/с"
 DEFAULT_RECORD_MOUSE_MOVES = True
+DEFAULT_BLOCK_PHYSICAL_MOUSE = False
 DRAG_PRECISION_MULTIPLIER = 0.64
 MIN_MOUSE_HOLD_SECONDS = 0.040
 MIN_MOUSE_GAP_SECONDS = 0.020
@@ -751,6 +753,7 @@ class AutomationRunner:
         on_progress: Callable[[str], None],
         on_finished: Callable[[bool, str | None], None],
         script_directory: Path | None = None,
+        block_physical_mouse: bool = DEFAULT_BLOCK_PHYSICAL_MOUSE,
     ) -> None:
         self.speed = speed
         self.on_progress = on_progress
@@ -758,6 +761,9 @@ class AutomationRunner:
         self.stop_event = threading.Event()
         self.mouse_controller: Any = None
         self.keyboard_controller: Any = None
+        self.block_physical_mouse = bool(block_physical_mouse)
+        self.mouse_blocker: WindowsPhysicalMouseBlocker | None = None
+        self.mouse_blocker_error: str | None = None
         self.pressed_buttons: list[Any] = []
         self.pressed_keys: list[Any] = []
         self.mouse_pressed_at: dict[Any, float] = {}
@@ -1042,6 +1048,28 @@ class AutomationRunner:
     def run_script(self, nodes: Iterable[ScriptNode]) -> None:
         self._run(lambda: self._execute_nodes(nodes))
 
+    def _mouse_blocker_failed(self, error: str) -> None:
+        self.mouse_blocker_error = error
+        self.stop_event.set()
+
+    def _start_mouse_blocker(self) -> None:
+        if not self.block_physical_mouse:
+            return
+        if not WINDOWS_NATIVE_AVAILABLE:
+            raise RuntimeError(
+                "Блокировка физической мыши доступна только в Windows"
+            )
+        self.mouse_blocker = WindowsPhysicalMouseBlocker(
+            on_error=self._mouse_blocker_failed,
+        )
+        self.mouse_blocker.start()
+
+        # If playback started while a physical button was held, the target
+        # application may already consider it pressed. Tagged UP events pass
+        # through the blocker and reset that state before the macro begins.
+        for button_name in ("left", "right", "middle"):
+            self.mouse_controller.release(resolve_button(button_name))
+
     def _run(self, task: Callable[[], Any]) -> None:
         error: str | None = None
         try:
@@ -1053,11 +1081,23 @@ class AutomationRunner:
             self.keyboard_controller = (
                 WindowsKeyboardController() if WINDOWS_NATIVE_AVAILABLE else keyboard.Controller()
             )
+            self._start_mouse_blocker()
             task()
+            if self.mouse_blocker_error is not None:
+                raise RuntimeError(
+                    "Блокировка физической мыши была отключена: "
+                    f"{self.mouse_blocker_error}"
+                )
         except Exception as exc:
             error = str(exc) or exc.__class__.__name__
         finally:
             self._release_all()
+            if self.mouse_blocker is not None:
+                try:
+                    self.mouse_blocker.stop()
+                except Exception as exc:
+                    if error is None:
+                        error = str(exc) or exc.__class__.__name__
             self.on_finished(self.stop_event.is_set(), error)
 
     def _release_all(self) -> None:
@@ -1115,6 +1155,9 @@ class MacroPilotApp:
         self.repeats_var = tk.StringVar(value="1")
         self.infinite_repeats_var = tk.BooleanVar(value=False)
         self.record_moves_var = tk.BooleanVar(value=DEFAULT_RECORD_MOUSE_MOVES)
+        self.block_physical_mouse_var = tk.BooleanVar(
+            value=DEFAULT_BLOCK_PHYSICAL_MOUSE
+        )
         self.recording_precision_var = tk.StringVar(value=DEFAULT_RECORDING_PRECISION)
         self.minimize_var = tk.BooleanVar(value=DEFAULT_MINIMIZE_ACTION_WINDOW)
         self.update_state_var = tk.StringVar(value="Обновления через GitHub Releases")
@@ -1485,6 +1528,29 @@ class MacroPilotApp:
         )
         self.infinite_checkbox.pack(side="left", padx=(8, 0))
 
+        playback_safety = ttk.Frame(
+            self.record_tab,
+            padding=(12, 8),
+            style="Card.TFrame",
+        )
+        playback_safety.pack(fill="x", pady=(0, 10))
+        self.block_physical_mouse_checkbox = ttk.Checkbutton(
+            playback_safety,
+            text="Блокировать физическую мышь при воспроизведении записи и сценария",
+            variable=self.block_physical_mouse_var,
+        )
+        self.block_physical_mouse_checkbox.pack(side="left")
+        block_hint = (
+            "Клавиатура и аварийная остановка F12 останутся доступны"
+            if WINDOWS_NATIVE_AVAILABLE
+            else "Доступно только в Windows"
+        )
+        ttk.Label(
+            playback_safety,
+            text=block_hint,
+            style="CardText.TLabel",
+        ).pack(side="left", padx=(12, 0))
+
         table_frame = ttk.Frame(self.record_tab, padding=1, style="Card.TFrame")
         table_frame.pack(fill="both", expand=True)
         columns = ("number", "time", "event", "details")
@@ -1558,6 +1624,19 @@ class MacroPilotApp:
         )
         self.script_speed_spin = ttk.Spinbox(toolbar, from_=0.1, to=10.0, increment=0.1, width=6, textvariable=self.speed_var)
         self.script_speed_spin.pack(side="left")
+
+        script_options = ttk.Frame(
+            self.script_tab,
+            padding=(12, 7),
+            style="Card.TFrame",
+        )
+        script_options.pack(fill="x", pady=(0, 10))
+        self.script_block_physical_mouse_checkbox = ttk.Checkbutton(
+            script_options,
+            text="Блокировать физическую мышь во время выполнения · F12 работает",
+            variable=self.block_physical_mouse_var,
+        )
+        self.script_block_physical_mouse_checkbox.pack(side="left")
 
         pane = ttk.Panedwindow(self.script_tab, orient="horizontal")
         pane.pack(fill="both", expand=True)
@@ -1959,6 +2038,10 @@ class MacroPilotApp:
         self._set_enabled(self.speed_spin, idle)
         self._set_enabled(self.repeats_spin, idle and not self.infinite_repeats_var.get())
         self._set_enabled(self.infinite_checkbox, idle)
+        self._set_enabled(
+            self.block_physical_mouse_checkbox,
+            idle and WINDOWS_NATIVE_AVAILABLE,
+        )
         self._set_enabled(self.stop_button, not idle)
 
         self._set_enabled(self.script_run_button, idle)
@@ -1967,6 +2050,10 @@ class MacroPilotApp:
         self._set_enabled(self.script_save_button, idle)
         self._set_enabled(self.script_example_button, idle)
         self._set_enabled(self.script_speed_spin, idle)
+        self._set_enabled(
+            self.script_block_physical_mouse_checkbox,
+            idle and WINDOWS_NATIVE_AVAILABLE,
+        )
         self._set_enabled(self.script_stop_button, not idle)
         updates_enabled = idle and not self.update_busy
         self._set_enabled(self.update_button, updates_enabled)
@@ -2366,6 +2453,7 @@ class MacroPilotApp:
             on_progress=lambda text: self._ui(self._set_progress, text),
             on_finished=lambda stopped, error: self._ui(self._runner_finished, stopped, error),
             script_directory=script_directory,
+            block_physical_mouse=self.block_physical_mouse_var.get(),
         )
 
     def _set_progress(self, text: str) -> None:
