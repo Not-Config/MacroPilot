@@ -46,15 +46,15 @@ jobs:
       - name: Run tests
         if: steps.release.outputs.exists != 'true'
         run: python -m unittest discover -s tests -v
-      - name: Build Windows executable
+      - name: Build portable Windows folder
         if: steps.release.outputs.exists != 'true'
-        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name MacroPilot --collect-submodules pynput main.py
+        run: python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss main.py
       - name: Package release assets
         if: steps.release.outputs.exists != 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path release/MacroPilot -Force | Out-Null
-          Copy-Item dist/MacroPilot.exe release/MacroPilot/
+          Copy-Item -Path dist/MacroPilot/* -Destination release/MacroPilot/ -Recurse -Force
           Copy-Item README.md,SUPPORT.md,CHANGELOG.md,LICENSE release/MacroPilot/
           Compress-Archive -Path release/MacroPilot -DestinationPath MacroPilot-windows.zip -Force
           git archive --format=zip --prefix=MacroPilot/ -o MacroPilot-source.zip HEAD
@@ -83,7 +83,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${{ steps.release.outputs.tag }}" `
-            dist/MacroPilot.exe `
             MacroPilot-windows.zip `
             MacroPilot-source.zip `
             --verify-tag `

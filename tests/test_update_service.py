@@ -1,6 +1,8 @@
 import hashlib
 import io
 import json
+import shutil
+import sys
 import tempfile
 import unittest
 import urllib.error
@@ -8,12 +10,16 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+import update_service
 from update_service import (
-    POWERSHELL_INSTALLER,
+    UPDATE_HELPER_FLAG,
+    UPDATE_STAGE_PREFIX,
     ReleaseAsset,
     UpdateError,
+    apply_staged_update,
     choose_release_asset,
     download_release_asset,
+    extract_update_archive,
     fetch_latest_release,
     inspect_update_archive,
     is_newer_version,
@@ -207,29 +213,78 @@ class UpdateServiceTests(unittest.TestCase):
                 opener=lambda _request, timeout: FakeResponse(b"{}", "not-a-number"),
             )
 
-    def test_installer_waits_copies_and_restarts(self):
-        self.assertIn("Get-Process -Id $ProcessId", POWERSHELL_INSTALLER)
-        self.assertIn("robocopy.exe", POWERSHELL_INSTALLER)
-        self.assertIn("Start-Process", POWERSHELL_INSTALLER)
+    def test_download_rejects_truncated_content_length_without_asset_size(self):
+        asset = ReleaseAsset(
+            name="MacroPilot-windows.zip",
+            download_url="https://example.test/windows.zip",
+            size=0,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "update.zip"
+            with self.assertRaisesRegex(UpdateError, "не полностью"):
+                download_release_asset(
+                    asset,
+                    path,
+                    opener=lambda _request, timeout: FakeResponse(b"short", "20"),
+                )
+
+    def test_staged_installer_waits_copies_and_restarts(self):
+        stage = Path(tempfile.mkdtemp(prefix=UPDATE_STAGE_PREFIX))
+        self.addCleanup(shutil.rmtree, stage, True)
+        payload = stage / "MacroPilot"
+        payload.mkdir()
+        (payload / "main.py").write_text("print('new')", encoding="utf-8")
+        (payload / "data.txt").write_text("payload", encoding="utf-8")
+
+        with tempfile.TemporaryDirectory() as directory:
+            install_path = Path(directory) / "installed"
+            launch_file = Path(sys.executable)
+            with (
+                mock.patch("update_service._wait_for_process_exit") as wait,
+                mock.patch("update_service._start_installed_app") as restart,
+            ):
+                result = apply_staged_update(
+                    1234,
+                    stage,
+                    payload,
+                    install_path,
+                    launch_file,
+                    str(install_path / "main.py"),
+                )
+
+            self.assertEqual(result, 0)
+            wait.assert_called_once_with(1234)
+            self.assertEqual((install_path / "data.txt").read_text(), "payload")
+            restart.assert_called_once()
+
+    def test_updater_does_not_invoke_powershell_or_bypass_policy(self):
+        source = Path(update_service.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("powershell.exe", source.casefold())
+        self.assertNotIn("executionpolicy", source.casefold())
 
     def test_installer_resets_inherited_pyinstaller_environment(self):
         with tempfile.TemporaryDirectory() as directory:
             archive = Path(directory) / "update.zip"
-            archive.write_bytes(b"update")
-            with (
-                mock.patch("update_service.tempfile.gettempdir", return_value=directory),
-                mock.patch("update_service.subprocess.Popen") as popen,
-            ):
+            archive.write_bytes(make_zip({"MacroPilot/main.py": "print('new')"}))
+            with mock.patch("update_service.subprocess.Popen") as popen:
                 launch_update_installer(archive, "MacroPilot")
 
+            command = popen.call_args.args[0]
             environment = popen.call_args.kwargs["env"]
             self.assertEqual(environment["PYINSTALLER_RESET_ENVIRONMENT"], "1")
-            scripts = list(Path(directory).glob("MacroPilot-update-*.ps1"))
-            self.assertEqual(len(scripts), 1)
-            self.assertIn(
-                '$env:PYINSTALLER_RESET_ENVIRONMENT = "1"',
-                scripts[0].read_text(encoding="utf-8-sig"),
-            )
+            self.assertEqual(command[2], UPDATE_HELPER_FLAG)
+            self.assertEqual(Path(command[1]).name, "main.py")
+            self.assertFalse(archive.exists())
+            stage = Path(command[4])
+            self.assertTrue(stage.name.startswith(UPDATE_STAGE_PREFIX))
+            self.addCleanup(shutil.rmtree, stage, True)
+
+    def test_extract_update_archive_rejects_unknown_layout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / "update.zip"
+            archive.write_bytes(make_zip({"MacroPilot/main.py": "ok"}))
+            with self.assertRaisesRegex(UpdateError, "неизвестную структуру"):
+                extract_update_archive(archive, "other")
 
 
 if __name__ == "__main__":

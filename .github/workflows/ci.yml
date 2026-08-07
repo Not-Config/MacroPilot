@@ -31,4 +31,4 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Compile Python files
-        run: python -m py_compile main.py macro_core.py windows_input.py update_service.py project_config.py
+        run: python -m py_compile main.py macro_core.py image_matcher.py windows_input.py update_service.py project_config.py

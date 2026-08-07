@@ -10,6 +10,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable, Iterable
 
+from image_matcher import ImageMatch, ScreenImageMatcher
 from macro_core import (
     APP_NAME,
     APP_VERSION,
@@ -35,9 +36,11 @@ from update_service import (
     ReleaseAsset,
     ReleaseInfo,
     UpdateError,
+    cleanup_previous_update_stage,
     choose_release_asset,
     download_release_asset,
     fetch_latest_release,
+    handle_update_command,
     inspect_update_archive,
     is_newer_version,
     launch_update_installer,
@@ -83,6 +86,11 @@ RECORDING_PRECISION_OPTIONS = {
 DEFAULT_RECORDING_PRECISION = "Обычная · 40/с"
 DEFAULT_RECORD_MOUSE_MOVES = True
 DRAG_PRECISION_MULTIPLIER = 0.64
+MIN_MOUSE_HOLD_SECONDS = 0.040
+MIN_MOUSE_GAP_SECONDS = 0.020
+IMAGE_SEARCH_INTERVAL_SECONDS = 0.20
+TK_CONTROL_MASK = 0x0004
+TK_SHIFT_MASK = 0x0001
 UI_COLORS = {
     "bg": "#0b1020",
     "surface": "#111827",
@@ -107,6 +115,8 @@ MOVE x y [секунды]
 MOVE_BY dx dy [секунды]
 CLICK [кнопка] [раз] [интервал]
 CLICK_AT x y [кнопка] [раз] [интервал]
+WAIT_IMAGE "файл.png" [тайм-аут] [сходство]
+CLICK_IMAGE "файл.png" [кнопка] [тайм-аут] [сходство]
 DOWN кнопка
 UP кнопка
 SCROLL dy
@@ -124,6 +134,11 @@ END
 
 КНОПКИ МЫШИ
 left, right, middle
+
+ПОИСК ИЗОБРАЖЕНИЯ
+Тайм-аут 0 ожидает без ограничения.
+Сходство: от 0.5 до 1; по умолчанию 0.9.
+Относительный путь считается от файла сценария.
 
 ПРИМЕРЫ КЛАВИШ
 enter, tab, space, esc, backspace,
@@ -735,6 +750,7 @@ class AutomationRunner:
         speed: float,
         on_progress: Callable[[str], None],
         on_finished: Callable[[bool, str | None], None],
+        script_directory: Path | None = None,
     ) -> None:
         self.speed = speed
         self.on_progress = on_progress
@@ -744,6 +760,13 @@ class AutomationRunner:
         self.keyboard_controller: Any = None
         self.pressed_buttons: list[Any] = []
         self.pressed_keys: list[Any] = []
+        self.mouse_pressed_at: dict[Any, float] = {}
+        self.mouse_released_at: dict[Any, float] = {}
+        self.script_directory = (
+            script_directory.resolve()
+            if script_directory is not None
+            else Path.cwd().resolve()
+        )
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -762,13 +785,29 @@ class AutomationRunner:
         except ValueError:
             pass
 
-    def _mouse_down(self, button: Any) -> None:
+    def _mouse_down(self, button: Any) -> bool:
+        if button in self.pressed_buttons:
+            return True
+        released_at = self.mouse_released_at.get(button)
+        if released_at is not None and not self.stop_event.is_set():
+            remaining_gap = MIN_MOUSE_GAP_SECONDS - (time.perf_counter() - released_at)
+            if remaining_gap > 0 and self.stop_event.wait(remaining_gap):
+                return False
         self.mouse_controller.press(button)
         self._track_press(self.pressed_buttons, button)
+        self.mouse_pressed_at[button] = time.perf_counter()
+        return True
 
     def _mouse_up(self, button: Any) -> None:
+        pressed_at = self.mouse_pressed_at.get(button)
+        if pressed_at is not None and not self.stop_event.is_set():
+            remaining_hold = MIN_MOUSE_HOLD_SECONDS - (time.perf_counter() - pressed_at)
+            if remaining_hold > 0:
+                self.stop_event.wait(remaining_hold)
         self.mouse_controller.release(button)
         self._track_release(self.pressed_buttons, button)
+        self.mouse_pressed_at.pop(button, None)
+        self.mouse_released_at[button] = time.perf_counter()
 
     def _key_down(self, key: Any) -> None:
         self.keyboard_controller.press(key)
@@ -826,7 +865,8 @@ class AutomationRunner:
         for index in range(count):
             if self.stop_event.is_set():
                 return False
-            self._mouse_down(button)
+            if not self._mouse_down(button):
+                return False
             if not self._wait(0.025):
                 self._mouse_up(button)
                 return False
@@ -834,6 +874,38 @@ class AutomationRunner:
             if index + 1 < count and not self._wait(interval):
                 return False
         return True
+
+    def _resolve_script_image(self, raw_path: str) -> Path:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self.script_directory / path
+        return path.resolve()
+
+    def _wait_for_image(
+        self,
+        raw_path: str,
+        timeout: float,
+        confidence: float,
+    ) -> ImageMatch | None:
+        image_path = self._resolve_script_image(raw_path)
+        started = time.monotonic()
+        with ScreenImageMatcher(image_path) as matcher:
+            while not self.stop_event.is_set():
+                match = matcher.find(confidence)
+                if match is not None:
+                    return match
+                elapsed = time.monotonic() - started
+                if timeout > 0 and elapsed >= timeout:
+                    raise RuntimeError(
+                        f'Изображение "{raw_path}" не появилось '
+                        f"за {timeout:g} с (сходство {confidence:.0%})"
+                    )
+                delay = IMAGE_SEARCH_INTERVAL_SECONDS
+                if timeout > 0:
+                    delay = min(delay, max(0.0, timeout - elapsed))
+                if self.stop_event.wait(delay):
+                    return None
+        return None
 
     def _execute_recorded_event(self, event: dict[str, Any]) -> None:
         event_type = event["type"]
@@ -915,9 +987,16 @@ class AutomationRunner:
         if name == "CLICK_AT":
             self.mouse_controller.position = (args[0], args[1])
             return self._click(resolve_button(args[2]), args[3], args[4])
+        if name == "WAIT_IMAGE":
+            return self._wait_for_image(args[0], args[1], args[2]) is not None
+        if name == "CLICK_IMAGE":
+            match = self._wait_for_image(args[0], args[2], args[3])
+            if match is None:
+                return False
+            self.mouse_controller.position = match.center
+            return self._click(resolve_button(args[1]), 1, 0.0)
         if name == "DOWN":
-            self._mouse_down(resolve_button(args[0]))
-            return True
+            return self._mouse_down(resolve_button(args[0]))
         if name == "UP":
             self._mouse_up(resolve_button(args[0]))
             return True
@@ -989,6 +1068,8 @@ class AutomationRunner:
                 except Exception:
                     pass
             self.pressed_buttons.clear()
+            self.mouse_pressed_at.clear()
+            self.mouse_released_at.clear()
         if self.keyboard_controller is not None:
             for key in reversed(self.pressed_keys[:]):
                 try:
@@ -1515,6 +1596,7 @@ class MacroPilotApp:
         script_y = ttk.Scrollbar(editor_frame, orient="vertical", command=self.script_text.yview)
         script_x = ttk.Scrollbar(editor_frame, orient="horizontal", command=self.script_text.xview)
         self.script_text.configure(yscrollcommand=script_y.set, xscrollcommand=script_x.set)
+        self.script_text.bind("<Control-KeyPress>", self._on_script_editor_control)
         self.script_text.grid(row=0, column=0, sticky="nsew")
         script_y.grid(row=0, column=1, sticky="ns")
         script_x.grid(row=1, column=0, sticky="ew")
@@ -1543,6 +1625,35 @@ class MacroPilotApp:
 
         self.script_text.insert("1.0", EXAMPLE_SCRIPT)
         self.script_text.edit_modified(False)
+
+    def _on_script_editor_control(self, event: Any) -> str | None:
+        """Keep editor shortcuts physical-key based on non-English layouts."""
+
+        if not int(getattr(event, "state", 0)) & TK_CONTROL_MASK:
+            return None
+        keycode = int(getattr(event, "keycode", 0))
+        keysym = str(getattr(event, "keysym", "")).lower()
+        action = {
+            67: "<<Copy>>",
+            86: "<<Paste>>",
+            88: "<<Cut>>",
+            65: "<<SelectAll>>",
+            90: "<<Redo>>" if int(event.state) & TK_SHIFT_MASK else "<<Undo>>",
+            89: "<<Redo>>",
+        }.get(keycode)
+        if action is None:
+            action = {
+                "c": "<<Copy>>",
+                "v": "<<Paste>>",
+                "x": "<<Cut>>",
+                "a": "<<SelectAll>>",
+                "z": "<<Redo>>" if int(event.state) & TK_SHIFT_MASK else "<<Undo>>",
+                "y": "<<Redo>>",
+            }.get(keysym)
+        if action is None:
+            return None
+        event.widget.event_generate(action)
+        return "break"
 
     def _build_about_tab(self) -> None:
         shell = ttk.Frame(self.about_tab, style="App.TFrame")
@@ -2172,6 +2283,19 @@ class MacroPilotApp:
             messagebox.showinfo(APP_NAME, f"Сценарий корректен.\nКоманд с учётом циклов: {program.estimated_steps}")
         return program
 
+    def _script_directory(self) -> Path:
+        if self.current_script_path is not None:
+            return self.current_script_path.resolve().parent
+        if bool(getattr(sys, "frozen", False)):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
+
+    def _resolve_script_image_path(self, raw_path: str) -> Path:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = self._script_directory() / path
+        return path.resolve()
+
     def _validate_script_keys(self, nodes: Iterable[ScriptNode]) -> None:
         for node in nodes:
             if isinstance(node, RepeatBlock):
@@ -2182,6 +2306,13 @@ class MacroPilotApp:
                         resolve_script_key(token)
                     except ValueError as exc:
                         raise ScriptError(node.line_no, str(exc)) from exc
+            elif node.name in {"WAIT_IMAGE", "CLICK_IMAGE"}:
+                image_path = self._resolve_script_image_path(node.args[0])
+                if not image_path.is_file():
+                    raise ScriptError(
+                        node.line_no,
+                        f"файл изображения не найден: {image_path}",
+                    )
 
     def play_script_countdown(self) -> None:
         program = self.validate_script_text(show_dialog=False)
@@ -2196,12 +2327,25 @@ class MacroPilotApp:
             f"Сценарий выполнит около {program.estimated_steps:,} команд.\n\nПродолжить?",
         ):
             return
-        self._start_countdown("Сценарий начнётся", lambda: self._begin_script_playback(speed, program.nodes))
+        script_directory = self._script_directory()
+        self._start_countdown(
+            "Сценарий начнётся",
+            lambda: self._begin_script_playback(
+                speed,
+                program.nodes,
+                script_directory,
+            ),
+        )
 
-    def _begin_script_playback(self, speed: float, nodes: Iterable[ScriptNode]) -> None:
+    def _begin_script_playback(
+        self,
+        speed: float,
+        nodes: Iterable[ScriptNode],
+        script_directory: Path,
+    ) -> None:
         if self.minimize_var.get():
             self._minimize_for_action()
-        self._start_runner(speed)
+        self._start_runner(speed, script_directory=script_directory)
         assert self.runner is not None
         self._set_mode("playing", "Выполняется сценарий · F12 — остановить")
         self.worker = threading.Thread(
@@ -2212,11 +2356,16 @@ class MacroPilotApp:
         )
         self.worker.start()
 
-    def _start_runner(self, speed: float) -> None:
+    def _start_runner(
+        self,
+        speed: float,
+        script_directory: Path | None = None,
+    ) -> None:
         self.runner = AutomationRunner(
             speed=speed,
             on_progress=lambda text: self._ui(self._set_progress, text),
             on_finished=lambda stopped, error: self._ui(self._runner_finished, stopped, error),
+            script_directory=script_directory,
         )
 
     def _set_progress(self, text: str) -> None:
@@ -2434,6 +2583,10 @@ class MacroPilotApp:
 
 
 def main() -> int:
+    update_result = handle_update_command()
+    if update_result is not None:
+        return update_result
+    cleanup_previous_update_stage()
     enable_windows_dpi_awareness()
     root = tk.Tk()
     if PYNPUT_IMPORT_ERROR is not None:
@@ -2448,6 +2601,28 @@ def main() -> int:
         root.destroy()
         return 1
     MacroPilotApp(root)
+
+    install_directory = (
+        Path(sys.executable).resolve().parent
+        if bool(getattr(sys, "frozen", False))
+        else Path(__file__).resolve().parent
+    )
+    update_error_log = install_directory / "update-error.log"
+    if update_error_log.is_file():
+        try:
+            update_error = update_error_log.read_text(encoding="utf-8-sig").strip()
+            update_error_log.unlink(missing_ok=True)
+        except OSError:
+            update_error = ""
+        if update_error:
+            root.after(
+                100,
+                lambda: messagebox.showerror(
+                    "Обновление",
+                    update_error,
+                    parent=root,
+                ),
+            )
     root.mainloop()
     return 0
 

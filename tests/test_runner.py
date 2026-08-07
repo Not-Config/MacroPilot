@@ -2,6 +2,8 @@ import threading
 import time
 import types
 import unittest
+import tempfile
+from pathlib import Path
 from unittest import mock
 
 import main
@@ -166,6 +168,76 @@ class AutomationRunnerTests(unittest.TestCase):
         self.assertIn(("press", "char:s"), self.keyboard_controller.log)
         self.assertEqual(self.keyboard_controller.log.count(("type", "a")), 1)
         self.assertEqual(self.keyboard_controller.log.count(("type", "b")), 1)
+
+    def test_game_clicks_keep_minimum_real_hold_and_release_gap(self) -> None:
+        waits = []
+        runner = main.AutomationRunner(
+            speed=100,
+            on_progress=lambda _text: None,
+            on_finished=lambda _stopped, _error: None,
+        )
+        runner.stop_event.wait = lambda seconds: waits.append(seconds) or False
+
+        runner.run_script(parse_script("CLICK left 2 0").nodes)
+
+        self.assertTrue(any(seconds >= 0.035 for seconds in waits), waits)
+        self.assertTrue(any(0.015 <= seconds <= 0.025 for seconds in waits), waits)
+        self.assertEqual(self.mouse_controller.log.count(("press", "mouse:left")), 2)
+        self.assertEqual(self.mouse_controller.log.count(("release", "mouse:left")), 2)
+
+    def test_script_editor_shortcuts_use_windows_physical_keycodes(self) -> None:
+        generated = []
+        widget = types.SimpleNamespace(event_generate=generated.append)
+        app = object.__new__(main.MacroPilotApp)
+
+        result_copy = app._on_script_editor_control(
+            types.SimpleNamespace(state=main.TK_CONTROL_MASK, keycode=67, keysym="Cyrillic_es", widget=widget)
+        )
+        result_paste = app._on_script_editor_control(
+            types.SimpleNamespace(state=main.TK_CONTROL_MASK, keycode=86, keysym="Cyrillic_em", widget=widget)
+        )
+
+        self.assertEqual(generated, ["<<Copy>>", "<<Paste>>"])
+        self.assertEqual((result_copy, result_paste), ("break", "break"))
+
+    def test_waits_for_image_and_clicks_its_center(self) -> None:
+        requested = []
+
+        class FakeMatcher:
+            def __init__(self, path):
+                requested.append(Path(path))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def find(self, confidence):
+                requested.append(confidence)
+                return main.ImageMatch(100, 200, 40, 20, 0.97)
+
+        with tempfile.TemporaryDirectory() as directory:
+            script_directory = Path(directory).resolve()
+            runner = main.AutomationRunner(
+                speed=1,
+                on_progress=lambda _text: None,
+                on_finished=lambda _stopped, _error: None,
+                script_directory=script_directory,
+            )
+            with mock.patch("main.ScreenImageMatcher", FakeMatcher):
+                runner.run_script(
+                    parse_script(
+                        'WAIT_IMAGE "ready.png" 2 0.9\n'
+                        'CLICK_IMAGE "play.png" right 2 0.95'
+                    ).nodes
+                )
+
+        self.assertIn(script_directory / "ready.png", requested)
+        self.assertIn(script_directory / "play.png", requested)
+        self.assertIn(("move", (120, 210)), self.mouse_controller.log)
+        self.assertIn(("press", "mouse:right"), self.mouse_controller.log)
+        self.assertIn(("release", "mouse:right"), self.mouse_controller.log)
 
     def test_stop_releases_held_inputs(self) -> None:
         entered_wait = threading.Event()

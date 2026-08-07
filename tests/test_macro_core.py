@@ -50,6 +50,25 @@ class ScriptParserTests(unittest.TestCase):
         self.assertIsInstance(command, ScriptCommand)
         self.assertEqual(command.args, ("left", 1, 0.1))
 
+    def test_parses_image_wait_and_click_commands(self) -> None:
+        program = parse_script(
+            'WAIT_IMAGE "images/ready.png" 0 0.85\n'
+            'CLICK_IMAGE "images/start.png" right 12 0.93'
+        )
+
+        self.assertEqual(
+            program.nodes[0].args,
+            ("images/ready.png", 0.0, 0.85),
+        )
+        self.assertEqual(
+            program.nodes[1].args,
+            ("images/start.png", "right", 12.0, 0.93),
+        )
+
+    def test_image_commands_validate_confidence(self) -> None:
+        with self.assertRaisesRegex(ScriptError, "сходство"):
+            parse_script('WAIT_IMAGE "ready.png" 10 0.2')
+
     def test_reports_source_line(self) -> None:
         with self.assertRaises(ScriptError) as caught:
             parse_script("WAIT 1\nCLICK fourth")

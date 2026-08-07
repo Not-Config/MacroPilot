@@ -13,7 +13,7 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
 MAX_MACRO_BYTES = 128 * 1024 * 1024
@@ -131,6 +131,15 @@ def _button(token: str, line_no: int) -> str:
     return value
 
 
+def _image_path(token: str, line_no: int) -> str:
+    value = token.strip()
+    if not value:
+        raise ScriptError(line_no, "путь к изображению не может быть пустым")
+    if len(value) > 4_096:
+        raise ScriptError(line_no, "путь к изображению слишком длинный")
+    return value
+
+
 def _arity(args: list[str], line_no: int, command: str, allowed: set[int]) -> None:
     if len(args) not in allowed:
         variants = ", ".join(str(item) for item in sorted(allowed))
@@ -179,6 +188,43 @@ def _parse_command(name: str, args: list[str], line_no: int) -> ScriptCommand:
                 count,
                 interval,
             ),
+            line_no,
+        )
+
+    if name == "WAIT_IMAGE":
+        _arity(args, line_no, name, {1, 2, 3})
+        timeout = (
+            _bounded_float(args[1], line_no, "тайм-аут", 0, 86_400)
+            if len(args) >= 2
+            else 30.0
+        )
+        confidence = (
+            _bounded_float(args[2], line_no, "сходство", 0.5, 1.0)
+            if len(args) == 3
+            else 0.9
+        )
+        return ScriptCommand(
+            name,
+            (_image_path(args[0], line_no), timeout, confidence),
+            line_no,
+        )
+
+    if name == "CLICK_IMAGE":
+        _arity(args, line_no, name, {1, 2, 3, 4})
+        button = _button(args[1], line_no) if len(args) >= 2 else "left"
+        timeout = (
+            _bounded_float(args[2], line_no, "тайм-аут", 0, 86_400)
+            if len(args) >= 3
+            else 30.0
+        )
+        confidence = (
+            _bounded_float(args[3], line_no, "сходство", 0.5, 1.0)
+            if len(args) == 4
+            else 0.9
+        )
+        return ScriptCommand(
+            name,
+            (_image_path(args[0], line_no), button, timeout, confidence),
             line_no,
         )
 
@@ -558,6 +604,9 @@ CLICK left
 WAIT 0.5
 TYPE "Привет из MacroPilot!" 0.04
 PRESS enter
+
+# Ждать до 30 секунд и кликнуть по центру найденной картинки:
+# CLICK_IMAGE "start-button.png" left 30 0.9
 
 REPEAT 3
     MOVE_BY 80 0 0.2
