@@ -12,6 +12,13 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Any, Callable, Iterable
 
+from app_settings import (
+    FUNCTION_HOTKEYS,
+    HotkeySettings,
+    load_hotkey_settings,
+    normalize_hotkey_name,
+    save_hotkey_settings,
+)
 from image_matcher import ImageMatch, ScreenImageMatcher
 from macro_core import (
     APP_NAME,
@@ -52,6 +59,7 @@ from update_service import (
     launch_update_installer,
     temporary_update_path,
 )
+from visual_script import VisualScriptEditor
 from windows_input import (
     KEYDOWN_MESSAGES,
     KEYUP_MESSAGES,
@@ -122,6 +130,9 @@ UI_COLORS = {
 }
 SCRIPT_HELP = """КОМАНДЫ
 
+Вкладка «Блоки» позволяет собирать эти же
+команды без ручного написания кода.
+
 WAIT секунды
 MOVE x y [секунды]
 MOVE_BY dx dy [секунды]
@@ -178,9 +189,8 @@ Windows: scan:11, scan:e0-4d
 
 # Это комментарий
 
-F9 — начать или продолжить запись
-F12 — остановить выполнение
-F10 — закончить запись
+Глобальные клавиши запуска, записи и остановки
+можно переназначить на вкладке «Настройки».
 """
 
 
@@ -275,6 +285,7 @@ class EventRecorder:
         report_error: Callable[[str], None],
         report_warning: Callable[[str], None] | None = None,
         move_interval: float = RECORDING_PRECISION_OPTIONS[DEFAULT_RECORDING_PRECISION],
+        hotkeys: HotkeySettings | None = None,
     ) -> None:
         self.record_moves = record_moves
         self.request_stop = request_stop
@@ -304,6 +315,7 @@ class EventRecorder:
             0.001,
             self.move_interval * DRAG_PRECISION_MULTIPLIER,
         )
+        self.hotkeys = hotkeys or HotkeySettings()
         self.mouse_listener: Any = None
         self.keyboard_listener: Any = None
         self.raw_mouse_listener: WindowsRawMouseListener | None = None
@@ -359,7 +371,7 @@ class EventRecorder:
             # the eventual release and lose the intended hold duration.
             if WINDOWS_NATIVE_AVAILABLE:
                 for key in get_pressed_scan_keys():
-                    if key.vk not in {VK_F9, VK_F10, VK_F12}:
+                    if key.vk not in self.hotkeys.reserved_vks:
                         self._record_key_change(self._scan_descriptor(key), True)
         except Exception:
             self.active = False
@@ -639,8 +651,8 @@ class EventRecorder:
             return True
         pressed = message in KEYDOWN_MESSAGES
         vk = int(data.vkCode)
-        if vk in {VK_F9, VK_F10, VK_F12}:
-            if pressed and vk in {VK_F10, VK_F12}:
+        if vk in self.hotkeys.reserved_vks:
+            if pressed and vk in self.hotkeys.recording_stop_vks:
                 self._signal_stop("Запись остановлена горячей клавишей")
             return False
         flags = int(data.flags)
@@ -660,8 +672,9 @@ class EventRecorder:
             return None
         if key is None:
             return None
-        if key in {keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f12}:
-            if key in {keyboard.Key.f10, keyboard.Key.f12}:
+        hotkey_name = normalize_hotkey_name(key)
+        if hotkey_name in self.hotkeys.reserved_names:
+            if hotkey_name in self.hotkeys.recording_stop_names:
                 self._signal_stop("Запись остановлена горячей клавишей")
             return False
         self._record_key_change(serialize_key(key), True)
@@ -672,7 +685,7 @@ class EventRecorder:
             return None
         if key is None:
             return None
-        if key in {keyboard.Key.f9, keyboard.Key.f10, keyboard.Key.f12}:
+        if normalize_hotkey_name(key) in self.hotkeys.reserved_names:
             return False
         self._record_key_change(serialize_key(key), False)
         return None
@@ -698,7 +711,8 @@ class EventRecorder:
     def stop(self) -> list[dict[str, Any]]:
         self.stop_requested.set()
         if self.active:
-            # Close unfinished holds at the exact stop time. This makes F10 a
+            # Close unfinished holds at the exact stop time. This makes the
+            # configured finish-recording key a
             # valid way to finish a recording even while a game key or mouse
             # button is still held.
             release_time = round(self._timestamp(), 6)
@@ -1474,7 +1488,8 @@ class MacroPilotApp:
         self.refresh_job: str | None = None
         self.window_was_minimized = False
         self.minimize_job: str | None = None
-        self.start_hotkey_held = False
+        self.hotkeys_held: set[str] = set()
+        self.hotkey_settings = load_hotkey_settings()
         self.record_prompt_active = False
         self.recording_append_mode = False
         self.recording_base_count = 0
@@ -1498,6 +1513,13 @@ class MacroPilotApp:
         self.recording_precision_var = tk.StringVar(value=DEFAULT_RECORDING_PRECISION)
         self.minimize_var = tk.BooleanVar(value=DEFAULT_MINIMIZE_ACTION_WINDOW)
         self.update_state_var = tk.StringVar(value="Обновления через GitHub Releases")
+        self.play_hotkey_var = tk.StringVar(value=self.hotkey_settings.play)
+        self.record_hotkey_var = tk.StringVar(value=self.hotkey_settings.record)
+        self.finish_hotkey_var = tk.StringVar(
+            value=self.hotkey_settings.finish_recording
+        )
+        self.stop_hotkey_var = tk.StringVar(value=self.hotkey_settings.stop)
+        self.hotkey_hint_var = tk.StringVar()
 
         self._configure_style()
         self._build_ui()
@@ -1759,14 +1781,18 @@ class MacroPilotApp:
         self.notebook.pack(fill="both", expand=True, padx=16, pady=(0, 10))
         self.record_tab = ttk.Frame(self.notebook, padding=12, style="App.TFrame")
         self.script_tab = ttk.Frame(self.notebook, padding=12, style="App.TFrame")
+        self.settings_tab = ttk.Frame(self.notebook, padding=12, style="App.TFrame")
         self.about_tab = ttk.Frame(self.notebook, padding=12, style="App.TFrame")
         self.notebook.add(self.record_tab, text="●  Запись")
         self.notebook.add(self.script_tab, text="{ }  Сценарий")
+        self.notebook.add(self.settings_tab, text="⚙  Настройки")
         self.notebook.add(self.about_tab, text="О проекте")
 
         self._build_record_tab()
         self._build_script_tab()
+        self._build_settings_tab()
         self._build_about_tab()
+        self._update_hotkey_labels()
 
         status_bar = ttk.Frame(self.root, style="Header.TFrame")
         status_bar.pack(fill="x", side="bottom")
@@ -1774,7 +1800,7 @@ class MacroPilotApp:
         ttk.Label(status_bar, textvariable=self.status_var, style="Status.TLabel").pack(
             side="left", fill="x", expand=True
         )
-        ttk.Label(status_bar, text="F9 — запись · F12 — стоп", style="Status.TLabel").pack(
+        ttk.Label(status_bar, textvariable=self.hotkey_hint_var, style="Status.TLabel").pack(
             side="right", padx=(8, 10)
         )
 
@@ -1783,21 +1809,21 @@ class MacroPilotApp:
         toolbar.pack(fill="x", pady=(0, 10))
         self.record_button = ttk.Button(
             toolbar,
-            text="●  Начать / продолжить (F9)",
+            text=f"●  Начать / продолжить ({self.hotkey_settings.record})",
             command=self.start_recording,
             style="Record.TButton",
         )
         self.record_button.pack(side="left")
         self.play_button = ttk.Button(
             toolbar,
-            text="▶  Воспроизвести",
+            text=f"▶  Воспроизвести ({self.hotkey_settings.play})",
             command=self.play_recording_countdown,
             style="Accent.TButton",
         )
         self.play_button.pack(side="left", padx=(7, 0))
         self.stop_button = ttk.Button(
             toolbar,
-            text="■  Остановить (F12)",
+            text=f"■  Остановить ({self.hotkey_settings.stop})",
             command=self.stop_current,
             style="Danger.TButton",
         )
@@ -1859,7 +1885,7 @@ class MacroPilotApp:
         self.repeats_spin.pack(side="left")
         self.infinite_checkbox = ttk.Checkbutton(
             settings,
-            text="∞ До F12",
+            text=f"∞ До {self.hotkey_settings.stop}",
             variable=self.infinite_repeats_var,
             command=self._refresh_controls,
         )
@@ -1877,16 +1903,12 @@ class MacroPilotApp:
             variable=self.block_physical_mouse_var,
         )
         self.block_physical_mouse_checkbox.pack(side="left")
-        block_hint = (
-            "Клавиатура и аварийная остановка F12 останутся доступны"
-            if WINDOWS_NATIVE_AVAILABLE
-            else "Доступно только в Windows"
-        )
-        ttk.Label(
+        self.block_physical_mouse_hint = ttk.Label(
             playback_safety,
-            text=block_hint,
+            text="",
             style="CardText.TLabel",
-        ).pack(side="left", padx=(12, 0))
+        )
+        self.block_physical_mouse_hint.pack(side="left", padx=(12, 0))
 
         table_frame = ttk.Frame(self.record_tab, padding=1, style="Card.TFrame")
         table_frame.pack(fill="both", expand=True)
@@ -1938,7 +1960,12 @@ class MacroPilotApp:
         self.script_run_button.pack(side="left")
         self.script_validate_button = ttk.Button(toolbar, text="Проверить", command=self.validate_script_text)
         self.script_validate_button.pack(side="left", padx=(6, 0))
-        self.script_stop_button = ttk.Button(toolbar, text="■ Остановить (F12)", command=self.stop_current, style="Danger.TButton")
+        self.script_stop_button = ttk.Button(
+            toolbar,
+            text=f"■ Остановить ({self.hotkey_settings.stop})",
+            command=self.stop_current,
+            style="Danger.TButton",
+        )
         self.script_stop_button.pack(side="left", padx=(6, 0))
         ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=12)
         self.script_open_button = ttk.Button(
@@ -1970,7 +1997,7 @@ class MacroPilotApp:
         script_options.pack(fill="x", pady=(0, 10))
         self.script_block_physical_mouse_checkbox = ttk.Checkbutton(
             script_options,
-            text="Блокировать физическую мышь во время выполнения · F12 работает",
+            text="Блокировать физическую мышь во время выполнения",
             variable=self.block_physical_mouse_var,
         )
         self.script_block_physical_mouse_checkbox.pack(side="left")
@@ -1987,7 +2014,18 @@ class MacroPilotApp:
             style="CardText.TLabel",
         ).pack(side="right", padx=(0, 10))
 
-        pane = ttk.Panedwindow(self.script_tab, orient="horizontal")
+        self.script_mode_notebook = ttk.Notebook(self.script_tab)
+        self.script_mode_notebook.pack(fill="both", expand=True)
+        self.script_code_tab = ttk.Frame(self.script_mode_notebook)
+        self.script_blocks_tab = ttk.Frame(self.script_mode_notebook)
+        self.script_mode_notebook.add(self.script_code_tab, text="  Код  ")
+        self.script_mode_notebook.add(self.script_blocks_tab, text="  Блоки  ")
+        self.script_mode_notebook.bind(
+            "<<NotebookTabChanged>>",
+            self._on_script_mode_changed,
+        )
+
+        pane = ttk.Panedwindow(self.script_code_tab, orient="horizontal")
         pane.pack(fill="both", expand=True)
 
         editor_frame = ttk.Frame(pane, padding=1, style="Card.TFrame")
@@ -2053,6 +2091,184 @@ class MacroPilotApp:
 
         self.script_text.insert("1.0", EXAMPLE_SCRIPT)
         self.script_text.edit_modified(False)
+
+        self.visual_script_editor = VisualScriptEditor(
+            self.script_blocks_tab,
+            on_source_changed=self._visual_source_changed,
+            on_status=self.status_var.set,
+        )
+        self.visual_script_editor.pack(fill="both", expand=True)
+        self.visual_script_editor.load_source(EXAMPLE_SCRIPT)
+
+    def _on_script_mode_changed(self, _event: Any = None) -> None:
+        if not hasattr(self, "visual_script_editor"):
+            return
+        if self.script_mode_notebook.select() != str(self.script_blocks_tab):
+            return
+        source = self.script_text.get("1.0", "end-1c")
+        try:
+            self.visual_script_editor.load_source(source)
+        except ScriptError as exc:
+            self.script_mode_notebook.select(self.script_code_tab)
+            self._highlight_script_error(exc.line_no)
+            self.status_var.set(f"Блоки не открыты: {exc}")
+            messagebox.showerror(
+                "Не удалось открыть блоки",
+                f"Сначала исправьте ошибку в коде:\n\n{exc}",
+                parent=self.root,
+            )
+            return
+        self.status_var.set(
+            "Визуальный редактор готов · двойной клик изменяет блок"
+        )
+
+    def _visual_source_changed(self, source: str) -> None:
+        self.script_text.delete("1.0", "end")
+        self.script_text.insert("1.0", source)
+        self.script_text.edit_modified(True)
+        self.current_script_path = None
+        self._clear_script_error()
+
+    def _show_code_editor(self) -> None:
+        self.script_mode_notebook.select(self.script_code_tab)
+
+    def _build_settings_tab(self) -> None:
+        shell = ttk.Frame(self.settings_tab, style="App.TFrame")
+        shell.pack(fill="both", expand=True)
+        card = ttk.LabelFrame(
+            shell,
+            text=" Глобальные горячие клавиши ",
+            padding=(24, 20),
+            style="Card.TLabelframe",
+        )
+        card.pack(fill="x", anchor="n")
+        ttk.Label(
+            card,
+            text=(
+                "Клавиши работают, даже когда MacroPilot свёрнут. Для игр доступны "
+                "надёжно перехватываемые F1–F20; каждое действие должно иметь свою клавишу."
+            ),
+            style="CardText.TLabel",
+            wraplength=820,
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 16))
+
+        rows = (
+            ("Запустить текущий макрос", self.play_hotkey_var),
+            ("Начать / продолжить запись", self.record_hotkey_var),
+            ("Завершить запись", self.finish_hotkey_var),
+            ("Аварийно остановить выполнение", self.stop_hotkey_var),
+        )
+        self.hotkey_combos: list[ttk.Combobox] = []
+        for row, (label, variable) in enumerate(rows, start=1):
+            ttk.Label(card, text=label, style="Card.TLabel").grid(
+                row=row, column=0, sticky="w", pady=6, padx=(0, 20)
+            )
+            combo = ttk.Combobox(
+                card,
+                values=FUNCTION_HOTKEYS,
+                textvariable=variable,
+                state="readonly",
+                width=9,
+            )
+            combo.grid(row=row, column=1, sticky="w", pady=6)
+            self.hotkey_combos.append(combo)
+
+        actions = ttk.Frame(card, style="Card.TFrame")
+        actions.grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(18, 0))
+        self.hotkey_save_button = ttk.Button(
+            actions,
+            text="Сохранить назначения",
+            command=self.save_hotkey_preferences,
+            style="Accent.TButton",
+        )
+        self.hotkey_save_button.pack(side="left")
+        self.hotkey_reset_button = ttk.Button(
+            actions,
+            text="Вернуть стандартные",
+            command=self.reset_hotkey_preferences,
+            style="Ghost.TButton",
+        )
+        self.hotkey_reset_button.pack(side="left", padx=(7, 0))
+
+        ttk.Label(
+            shell,
+            text=(
+                "Во время записи назначенные клавиши управления не попадают в макрос. "
+                "Аварийная остановка остаётся доступной при блокировке физической мыши."
+            ),
+            style="CardText.TLabel",
+            wraplength=850,
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(12, 0))
+
+    def reset_hotkey_preferences(self) -> None:
+        defaults = HotkeySettings()
+        self.play_hotkey_var.set(defaults.play)
+        self.record_hotkey_var.set(defaults.record)
+        self.finish_hotkey_var.set(defaults.finish_recording)
+        self.stop_hotkey_var.set(defaults.stop)
+        self.status_var.set("Стандартные назначения выбраны · нажмите «Сохранить»")
+
+    def save_hotkey_preferences(self) -> None:
+        if self.mode != "idle":
+            return
+        try:
+            settings = HotkeySettings(
+                play=self.play_hotkey_var.get(),
+                record=self.record_hotkey_var.get(),
+                finish_recording=self.finish_hotkey_var.get(),
+                stop=self.stop_hotkey_var.get(),
+            )
+            save_hotkey_settings(settings)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(
+                "Горячие клавиши",
+                f"Не удалось сохранить настройки:\n{exc}",
+                parent=self.root,
+            )
+            return
+        self.hotkey_settings = settings
+        self.hotkeys_held.clear()
+        self._restart_safety_listener()
+        self._update_hotkey_labels()
+        self.status_var.set("Горячие клавиши сохранены и уже работают")
+
+    def _restart_safety_listener(self) -> None:
+        listener = self.safety_listener
+        self.safety_listener = None
+        if listener is not None:
+            try:
+                listener.stop()
+            except Exception:
+                pass
+        self._start_safety_listener()
+
+    def _update_hotkey_labels(self) -> None:
+        keys = self.hotkey_settings
+        self.record_button.configure(
+            text=f"●  Начать / продолжить ({keys.record})"
+        )
+        self.play_button.configure(text=f"▶  Воспроизвести ({keys.play})")
+        self.stop_button.configure(text=f"■  Остановить ({keys.stop})")
+        self.script_run_button.configure(text=f"▶  Запустить ({keys.play})")
+        self.script_stop_button.configure(text=f"■ Остановить ({keys.stop})")
+        self.infinite_checkbox.configure(text=f"∞ До {keys.stop}")
+        self.hotkey_hint_var.set(
+            f"{keys.play} — запуск · {keys.record} — запись · {keys.stop} — стоп"
+        )
+        hint = (
+            f"Клавиатура и аварийная остановка {keys.stop} останутся доступны"
+            if WINDOWS_NATIVE_AVAILABLE
+            else "Доступно только в Windows"
+        )
+        self.block_physical_mouse_hint.configure(text=hint)
+        self.script_block_physical_mouse_checkbox.configure(
+            text=(
+                "Блокировать физическую мышь во время выполнения · "
+                f"{keys.stop} работает"
+            )
+        )
 
     def _on_script_editor_control(self, event: Any) -> str | None:
         """Keep editor shortcuts physical-key based on non-English layouts."""
@@ -2149,6 +2365,24 @@ class MacroPilotApp:
         width: int,
         height: int,
     ) -> None:
+        if self.script_mode_notebook.select() == str(self.script_blocks_tab):
+            self.visual_script_editor.insert_action(
+                command_name,
+                {
+                    "variable": variable,
+                    "x": str(x),
+                    "y": str(y),
+                    "width": str(width),
+                    "height": str(height),
+                    "language": "auto",
+                },
+                (
+                    f"Добавлен блок {command_name} {variable} · "
+                    f"область {width}×{height} в ({x}, {y})"
+                ),
+            )
+            return
+        self._show_code_editor()
         before_cursor = self.script_text.get("insert linestart", "insert")
         indent = before_cursor[: len(before_cursor) - len(before_cursor.lstrip())]
         prefix = "\n" + indent if before_cursor.strip() else ""
@@ -2426,21 +2660,41 @@ class MacroPilotApp:
         except tk.TclError:
             pass
 
+    def start_current_playback(self) -> None:
+        if self.mode != "idle":
+            return
+        selected = self.notebook.select()
+        if selected == str(self.script_tab):
+            self.play_script_countdown()
+        elif selected == str(self.record_tab):
+            self.play_recording_countdown()
+        elif self.events:
+            self.play_recording_countdown()
+        else:
+            self.play_script_countdown()
+
     def _start_safety_listener(self) -> None:
         if keyboard is None:
             return
 
         def on_press(key: Any, _injected: bool = False) -> None:
-            if key == keyboard.Key.f9:
-                if not self.start_hotkey_held:
-                    self.start_hotkey_held = True
-                    self._ui(self.start_recording)
-            elif key == keyboard.Key.f12:
+            name = normalize_hotkey_name(key)
+            if name is None or name in self.hotkeys_held:
+                return
+            self.hotkeys_held.add(name)
+            if name == self.hotkey_settings.play:
+                self._ui(self.start_current_playback)
+            elif name == self.hotkey_settings.record:
+                self._ui(self.start_recording)
+            elif name == self.hotkey_settings.finish_recording:
+                self._ui(self.finish_recording)
+            elif name == self.hotkey_settings.stop:
                 self._ui(self.stop_current)
 
         def on_release(key: Any, _injected: bool = False) -> None:
-            if key == keyboard.Key.f9:
-                self.start_hotkey_held = False
+            name = normalize_hotkey_name(key)
+            if name is not None:
+                self.hotkeys_held.discard(name)
 
         try:
             self.safety_listener = keyboard.Listener(
@@ -2449,7 +2703,7 @@ class MacroPilotApp:
             )
             self.safety_listener.start()
         except Exception as exc:
-            self.status_var.set(f"Не удалось включить глобальные F9/F12: {exc}")
+            self.status_var.set(f"Не удалось включить глобальные клавиши: {exc}")
 
     def _refresh_controls(self) -> None:
         idle = self.mode == "idle"
@@ -2486,6 +2740,11 @@ class MacroPilotApp:
             idle and WINDOWS_NATIVE_AVAILABLE,
         )
         self._set_enabled(self.script_stop_button, not idle)
+        self.visual_script_editor.set_enabled(idle)
+        for combo in self.hotkey_combos:
+            self._set_enabled(combo, idle)
+        self._set_enabled(self.hotkey_save_button, idle)
+        self._set_enabled(self.hotkey_reset_button, idle)
         updates_enabled = idle and not self.update_busy
         self._set_enabled(self.update_button, updates_enabled)
         self._set_enabled(self.about_update_button, updates_enabled)
@@ -2530,7 +2789,8 @@ class MacroPilotApp:
         return repeats
 
     def _start_countdown(self, label: str, callback: Callable[[], None]) -> None:
-        self._set_mode("countdown", f"{label} через 3… F12 — отмена")
+        stop_key = self.hotkey_settings.stop
+        self._set_mode("countdown", f"{label} через 3… {stop_key} — отмена")
 
         def tick(value: int) -> None:
             if self.mode != "countdown":
@@ -2539,7 +2799,7 @@ class MacroPilotApp:
                 self.countdown_job = None
                 callback()
                 return
-            self.status_var.set(f"{label} через {value}… F12 — отмена")
+            self.status_var.set(f"{label} через {value}… {stop_key} — отмена")
             self.countdown_job = self.root.after(1000, tick, value - 1)
 
         tick(3)
@@ -2597,6 +2857,7 @@ class MacroPilotApp:
             report_error=lambda text: self._ui(self.status_var.set, f"Ошибка записи: {text}"),
             report_warning=lambda text: self._ui(self._show_recording_warning, text),
             move_interval=move_interval,
+            hotkeys=self.hotkey_settings,
         )
         self.recorder.capacity_base_count = base_count
         self.recorder.max_recorded_events = available_events
@@ -2618,7 +2879,9 @@ class MacroPilotApp:
         action = "Продолжается запись" if append else "Идёт запись"
         input_mode = " игровых scan-кодов" if WINDOWS_NATIVE_AVAILABLE else ""
         recording_status = (
-            f"{action}{input_mode} · {precision_name} · F10 или F12 — закончить"
+            f"{action}{input_mode} · {precision_name} · "
+            f"{self.hotkey_settings.finish_recording} или "
+            f"{self.hotkey_settings.stop} — закончить"
         )
         self._set_mode("recording", recording_status)
         if self.minimize_var.get():
@@ -2767,9 +3030,9 @@ class MacroPilotApp:
         self._start_runner(speed)
         assert self.runner is not None
         status = (
-            "Бесконечное воспроизведение · F12 — остановить"
+            f"Бесконечное воспроизведение · {self.hotkey_settings.stop} — остановить"
             if repeats is None
-            else "Воспроизведение записи · F12 — остановить"
+            else f"Воспроизведение записи · {self.hotkey_settings.stop} — остановить"
         )
         self._set_mode("playing", status)
         self.worker = threading.Thread(
@@ -2868,7 +3131,10 @@ class MacroPilotApp:
             self._minimize_for_action()
         self._start_runner(speed, script_directory=script_directory)
         assert self.runner is not None
-        self._set_mode("playing", "Выполняется сценарий · F12 — остановить")
+        self._set_mode(
+            "playing",
+            f"Выполняется сценарий · {self.hotkey_settings.stop} — остановить",
+        )
         self.worker = threading.Thread(
             target=self.runner.run_script,
             args=(tuple(nodes),),
@@ -2892,7 +3158,9 @@ class MacroPilotApp:
 
     def _set_progress(self, text: str) -> None:
         if self.mode == "playing":
-            self.status_var.set(f"{text} · F12 — остановить")
+            self.status_var.set(
+                f"{text} · {self.hotkey_settings.stop} — остановить"
+            )
 
     def _runner_finished(self, stopped: bool, error: str | None) -> None:
         self.runner = None
@@ -3026,9 +3294,11 @@ class MacroPilotApp:
         self.script_text.edit_modified(True)
         self.current_script_path = None
         self.notebook.select(self.script_tab)
+        self._show_code_editor()
         self.status_var.set("Запись преобразована в редактируемый сценарий")
 
     def load_example_script(self) -> None:
+        self._show_code_editor()
         self.script_text.delete("1.0", "end")
         self.script_text.insert("1.0", EXAMPLE_SCRIPT)
         self.script_text.edit_modified(False)
@@ -3062,6 +3332,7 @@ class MacroPilotApp:
         )
         if not path:
             return
+        self._show_code_editor()
         try:
             source = Path(path)
             if source.stat().st_size > 2 * 1024 * 1024:

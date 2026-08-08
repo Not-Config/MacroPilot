@@ -20,7 +20,7 @@
 
 ```bash
 python -m unittest discover -s tests -v
-python -m py_compile main.py macro_core.py windows_input.py update_service.py project_config.py
+python -m py_compile main.py macro_core.py app_settings.py visual_script.py image_matcher.py ocr_reader.py windows_input.py update_service.py project_config.py
 ```
 
 4. В Pull Request кратко опишите причину, изменения и результат тестов.

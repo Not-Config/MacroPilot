@@ -58,6 +58,7 @@ class FakeKey:
     ctrl = "key:ctrl"
     shift = "key:shift"
     space = "key:space"
+    f8 = "key:f8"
     f9 = "key:f9"
     f10 = "key:f10"
     f12 = "key:f12"
@@ -1012,9 +1013,11 @@ class AutomationRunnerTests(unittest.TestCase):
         self.assertEqual([event["t"] for event in app.events], [1.0, 2.0, 2.25, 2.75])
         self.assertEqual([event["x"] for event in app.events[-2:]], [3, 4])
 
-    def test_global_f9_starts_once_per_press_and_f12_stops(self) -> None:
+    def test_global_hotkeys_are_debounced_and_dispatch_actions(self) -> None:
         callbacks = {}
+        plays = []
         starts = []
+        finishes = []
         stops = []
 
         class FakeListener:
@@ -1026,8 +1029,11 @@ class AutomationRunnerTests(unittest.TestCase):
 
         main.keyboard = types.SimpleNamespace(Key=FakeKey, Listener=FakeListener)
         app = object.__new__(main.MacroPilotApp)
-        app.start_hotkey_held = False
+        app.hotkey_settings = main.HotkeySettings()
+        app.hotkeys_held = set()
+        app.start_current_playback = lambda: plays.append("play")
         app.start_recording = lambda: starts.append("start")
+        app.finish_recording = lambda: finishes.append("finish")
         app.stop_current = lambda: stops.append("stop")
         app._ui = lambda callback, *args: callback(*args)
         app.status_var = types.SimpleNamespace(set=lambda _text: None)
@@ -1037,10 +1043,47 @@ class AutomationRunnerTests(unittest.TestCase):
         callbacks["on_press"](FakeKey.f9)
         callbacks["on_release"](FakeKey.f9)
         callbacks["on_press"](FakeKey.f9)
+        callbacks["on_press"](FakeKey.f8)
+        callbacks["on_press"](FakeKey.f10)
         callbacks["on_press"](FakeKey.f12)
 
+        self.assertEqual(plays, ["play"])
         self.assertEqual(starts, ["start", "start"])
+        self.assertEqual(finishes, ["finish"])
         self.assertEqual(stops, ["stop"])
+
+    def test_global_listener_uses_custom_hotkeys(self) -> None:
+        callbacks = {}
+        calls = []
+
+        class FakeListener:
+            def __init__(self, **received):
+                callbacks.update(received)
+
+            def start(self):
+                pass
+
+        main.keyboard = types.SimpleNamespace(Key=FakeKey, Listener=FakeListener)
+        app = object.__new__(main.MacroPilotApp)
+        app.hotkey_settings = main.HotkeySettings(
+            play="F1",
+            record="F2",
+            finish_recording="F3",
+            stop="F4",
+        )
+        app.hotkeys_held = set()
+        app.start_current_playback = lambda: calls.append("play")
+        app.start_recording = lambda: calls.append("record")
+        app.finish_recording = lambda: calls.append("finish")
+        app.stop_current = lambda: calls.append("stop")
+        app._ui = lambda callback, *args: callback(*args)
+        app.status_var = types.SimpleNamespace(set=lambda _text: None)
+
+        app._start_safety_listener()
+        for key in ("key:f1", "key:f2", "key:f3", "key:f4"):
+            callbacks["on_press"](key)
+
+        self.assertEqual(calls, ["play", "record", "finish", "stop"])
 
     def test_infinite_recording_repeats_until_stop(self) -> None:
         second_click = threading.Event()

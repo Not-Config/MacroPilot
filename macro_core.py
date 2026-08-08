@@ -14,7 +14,7 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "1.10.2"
+APP_VERSION = "1.11.0"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
 MAX_MACRO_BYTES = 128 * 1024 * 1024
@@ -466,6 +466,95 @@ def parse_script(text: str) -> ScriptProgram:
     return ScriptProgram(tuple(root), estimated_steps)
 
 
+def _script_number(value: int | float) -> str:
+    number = float(value)
+    if number == 0:
+        return "0"
+    if number.is_integer():
+        return str(int(number))
+    return format(number, ".12g")
+
+
+def _script_string(value: Any) -> str:
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def script_nodes_to_text(nodes: Iterable[ScriptNode]) -> str:
+    """Serialize parsed nodes to stable, editable MacroPilot source code."""
+
+    lines: list[str] = []
+
+    def write(items: Iterable[ScriptNode], depth: int) -> None:
+        prefix = "    " * depth
+        for node in items:
+            if isinstance(node, RepeatBlock):
+                lines.append(f"{prefix}REPEAT {node.count}")
+                write(node.body, depth + 1)
+                lines.append(f"{prefix}END")
+                continue
+            if isinstance(node, IfBlock):
+                name = "IF_TEXT" if node.value_kind == "text" else "IF_NUMBER"
+                expected = (
+                    _script_string(node.expected)
+                    if node.value_kind == "text"
+                    else _script_number(node.expected)
+                )
+                lines.append(
+                    f"{prefix}{name} {node.variable} {node.operator} {expected}"
+                )
+                write(node.true_body, depth + 1)
+                if node.false_body:
+                    lines.append(f"{prefix}ELSE")
+                    write(node.false_body, depth + 1)
+                lines.append(f"{prefix}END")
+                continue
+
+            name = node.name
+            args = node.args
+            if name == "WAIT":
+                suffix = _script_number(args[0])
+            elif name in {"MOVE", "MOVE_BY"}:
+                suffix = f"{args[0]} {args[1]} {_script_number(args[2])}"
+            elif name == "CLICK":
+                suffix = f"{args[0]} {args[1]} {_script_number(args[2])}"
+            elif name == "CLICK_AT":
+                suffix = (
+                    f"{args[0]} {args[1]} {args[2]} {args[3]} "
+                    f"{_script_number(args[4])}"
+                )
+            elif name == "WAIT_IMAGE":
+                suffix = (
+                    f"{_script_string(args[0])} {_script_number(args[1])} "
+                    f"{_script_number(args[2])}"
+                )
+            elif name == "CLICK_IMAGE":
+                suffix = (
+                    f"{_script_string(args[0])} {args[1]} "
+                    f"{_script_number(args[2])} {_script_number(args[3])}"
+                )
+            elif name in {"OCR_TEXT", "OCR_NUMBER"}:
+                suffix = (
+                    f"{args[0]} {args[1]} {args[2]} {args[3]} {args[4]} "
+                    f"{_script_string(args[5])}"
+                )
+            elif name in {"DOWN", "UP"}:
+                suffix = str(args[0])
+            elif name == "SCROLL":
+                suffix = f"{args[0]} {args[1]}"
+            elif name in {"PRESS", "KEY_DOWN", "KEY_UP"}:
+                suffix = _script_string(args[0])
+            elif name == "HOTKEY":
+                suffix = " ".join(_script_string(value) for value in args)
+            elif name == "TYPE":
+                suffix = f"{_script_string(args[0])} {_script_number(args[1])}"
+            else:  # pragma: no cover - parser prevents unknown commands
+                raise ValueError(f"Неизвестная команда: {name}")
+            lines.append(f"{prefix}{name} {suffix}")
+
+    write(nodes, 0)
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def _json_number(value: Any, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise MacroFormatError(f"{label}: требуется число")
@@ -702,7 +791,7 @@ def events_to_script(events: Iterable[dict[str, Any]]) -> str:
     normalized = compact_repeated_key_events(events)
     lines = [
         "# Сценарий создан из записи MacroPilot.",
-        "# F12 — аварийная остановка.",
+        "# Аварийная остановка — назначенная клавиша в настройках.",
     ]
     previous_time = 0.0
 
@@ -733,7 +822,7 @@ def events_to_script(events: Iterable[dict[str, Any]]) -> str:
 
 
 EXAMPLE_SCRIPT = '''# Пример сценария MacroPilot
-# После запуска будет обратный отсчёт. F12 останавливает выполнение.
+# После запуска будет обратный отсчёт. Клавиша остановки задаётся в настройках.
 
 MOVE 500 350 0.4
 CLICK left

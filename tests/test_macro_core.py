@@ -17,6 +17,7 @@ from macro_core import (
     macro_duration,
     parse_script,
     save_macro,
+    script_nodes_to_text,
     validate_events,
 )
 
@@ -140,6 +141,30 @@ class ScriptParserTests(unittest.TestCase):
     def test_rejects_unknown_or_python_code(self) -> None:
         with self.assertRaisesRegex(ScriptError, "неизвестная команда"):
             parse_script("__import__('os').system('echo no')")
+
+    def test_serializes_nested_program_and_round_trips(self) -> None:
+        source = '''
+        OCR_TEXT state 10 20 300 40 ru-RU
+        IF_TEXT state CONTAINS "ready now"
+            CLICK_IMAGE "images/start button.png" left 12 0.91
+            REPEAT 2
+                HOTKEY ctrl shift "a"
+                TYPE "Привет ${state}" 0.02
+            END
+        ELSE
+            MOVE_BY -20 5 0
+        END
+        '''
+        first = parse_script(source)
+        serialized = script_nodes_to_text(first.nodes)
+        second = parse_script(serialized)
+
+        self.assertEqual(script_nodes_to_text(second.nodes), serialized)
+        self.assertIn('IF_TEXT state CONTAINS "ready now"', serialized)
+        self.assertIn('CLICK_IMAGE "images/start button.png" left 12 0.91', serialized)
+
+    def test_serializes_empty_program(self) -> None:
+        self.assertEqual(script_nodes_to_text(()), "")
 
 
 class MacroFormatTests(unittest.TestCase):
