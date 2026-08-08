@@ -3375,7 +3375,7 @@ class MacroPilotApp:
         self.root.destroy()
 
 
-def main() -> int:
+def legacy_main() -> int:
     update_result = handle_update_command()
     if update_result is not None:
         return update_result
@@ -3418,6 +3418,39 @@ def main() -> int:
             )
     root.mainloop()
     return 0
+
+
+def main() -> int:
+    """Launch the PySide6 interface while keeping update-helper startup minimal."""
+
+    update_result = handle_update_command()
+    if update_result is not None:
+        return update_result
+    cleanup_previous_update_stage()
+    enable_windows_dpi_awareness()
+
+    # When main.py is executed as a script, qt_app imports the recorder and
+    # runner from ``main``. Reuse this already-loaded module instead of
+    # executing the file a second time under another module name.
+    sys.modules.setdefault("main", sys.modules[__name__])
+    try:
+        from qt_app import run_app
+    except ModuleNotFoundError as exc:
+        if exc.name != "PySide6" and not str(exc.name).startswith("PySide6."):
+            raise
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            APP_NAME,
+            "Не удалось загрузить интерфейс PySide6.\n\n"
+            "Установите зависимости командой:\n"
+            "python -m pip install -r requirements.txt\n\n"
+            f"Техническая информация: {exc}",
+            parent=root,
+        )
+        root.destroy()
+        return 1
+    return run_app()
 
 
 if __name__ == "__main__":
