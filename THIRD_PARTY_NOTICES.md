@@ -8,4 +8,4 @@
 - GNU Lesser General Public License 3.0: <https://www.gnu.org/licenses/lgpl-3.0.html>
 - Qt licensing: <https://www.qt.io/licensing/open-source-lgpl-obligations>
 
-Официальный Windows-архив MacroPilot включает лицензионные файлы, поставляемые вместе с установленным пакетом `PySide6-Essentials`. Не удаляйте папку `_internal` и включённые уведомления при распространении готовой сборки.
+Официальный Windows-архив MacroPilot включает `README.md` с этим уведомлением и ссылками на условия Qt. Библиотеки Qt загружаются динамически из папки `_internal`. При дальнейшем распространении готовой сборки не удаляйте уведомления и предоставьте получателям применимые тексты сторонних лицензий.
