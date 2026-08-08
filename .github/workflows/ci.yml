@@ -37,3 +37,4 @@ jobs:
         run: |
           python -m pip install pyinstaller==6.21.0
           python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss --collect-submodules winrt main.py
+          .\dist\MacroPilot\MacroPilot.exe --smoke-test

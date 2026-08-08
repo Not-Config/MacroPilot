@@ -3434,7 +3434,7 @@ def main() -> int:
     # executing the file a second time under another module name.
     sys.modules.setdefault("main", sys.modules[__name__])
     try:
-        from qt_app import run_app
+        from qt_app import run_app, run_smoke_test
     except ModuleNotFoundError as exc:
         if exc.name != "PySide6" and not str(exc.name).startswith("PySide6."):
             raise
@@ -3450,6 +3450,8 @@ def main() -> int:
         )
         root.destroy()
         return 1
+    if "--smoke-test" in sys.argv:
+        return run_smoke_test()
     return run_app()
 
 

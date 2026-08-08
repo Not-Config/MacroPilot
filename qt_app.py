@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 import threading
@@ -298,7 +299,7 @@ class CodeEditor(QPlainTextEdit):
 
 
 class MacroPilotQtWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, enable_global_services: bool = True) -> None:
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1360, 860)
@@ -336,10 +337,12 @@ class MacroPilotQtWindow(QMainWindow):
 
         self._build_ui()
         self._connect_bridge()
-        self._start_safety_listener()
+        if enable_global_services:
+            self._start_safety_listener()
         self._refresh_event_table()
         self._refresh_controls()
-        QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
+        if enable_global_services:
+            QTimer.singleShot(1800, lambda: self.check_for_updates(manual=False))
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -1702,13 +1705,37 @@ QCheckBox::indicator { width: 16px; height: 16px; }
 """
 
 
-def run_app() -> int:
-    application = QApplication.instance() or QApplication(sys.argv)
+def _configure_application(application: QApplication) -> None:
     application.setApplicationName(APP_NAME)
     application.setApplicationVersion(APP_VERSION)
     application.setOrganizationName(AUTHOR_NAME)
     application.setStyle("Fusion")
     application.setStyleSheet(APP_STYLE_SHEET)
+
+
+def run_smoke_test() -> int:
+    """Construct the packaged Qt UI without hooks, network access, or a window."""
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    application = QApplication.instance() or QApplication([APP_NAME, "--smoke-test"])
+    _configure_application(application)
+    window = MacroPilotQtWindow(enable_global_services=False)
+    try:
+        if window.graph_editor.to_source() != "WAIT 0\n":
+            return 2
+        window.graph_editor.load_source("WAIT 0.1\nCLICK left\n")
+        if "CLICK left" not in window.graph_editor.to_source():
+            return 3
+        application.processEvents()
+    finally:
+        window.close()
+        application.processEvents()
+    return 0
+
+
+def run_app() -> int:
+    application = QApplication.instance() or QApplication(sys.argv)
+    _configure_application(application)
     if PYNPUT_IMPORT_ERROR is not None:
         QMessageBox.critical(
             None,
