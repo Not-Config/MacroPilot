@@ -15,8 +15,13 @@ if not exist ".venv\Scripts\python.exe" (
 call ".venv\Scripts\activate.bat"
 python -m pip install --disable-pip-version-check -r requirements-build.txt
 if errorlevel 1 goto :error
-python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --collect-submodules pynput --collect-submodules mss --collect-submodules winrt main.py
+python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name MacroPilot --hidden-import qt_app --hidden-import qt_graph --hidden-import graph_model --collect-submodules pynput --collect-submodules mss --collect-submodules winrt main.py
 if errorlevel 1 goto :error
+copy /y README.md "dist\MacroPilot\" >nul
+copy /y SUPPORT.md "dist\MacroPilot\" >nul
+copy /y CHANGELOG.md "dist\MacroPilot\" >nul
+copy /y LICENSE "dist\MacroPilot\" >nul
+copy /y THIRD_PARTY_NOTICES.md "dist\MacroPilot\" >nul
 
 echo.
 echo Build complete: dist\MacroPilot\MacroPilot.exe
