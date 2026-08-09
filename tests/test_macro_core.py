@@ -105,6 +105,13 @@ class ScriptParserTests(unittest.TestCase):
         self.assertIsInstance(command, ScriptCommand)
         self.assertEqual(command.args, ("left", 1, 0.1))
 
+    def test_parses_side_buttons_and_wheel_click_aliases(self) -> None:
+        program = parse_script("CLICK x1\nDOWN x2\nUP wheel\nCLICK назад")
+        self.assertEqual(
+            [command.args[0] for command in program.nodes],
+            ["x1", "x2", "middle", "x1"],
+        )
+
     def test_parses_image_wait_and_click_commands(self) -> None:
         program = parse_script(
             'WAIT_IMAGE "images/ready.png" 0 0.85\n'
@@ -283,6 +290,51 @@ class MacroFormatTests(unittest.TestCase):
         self.assertIn("KEY_DOWN scan:11", script)
         self.assertIn("KEY_UP scan:e0-4d", script)
         self.assertEqual(parse_script(script).estimated_steps, 4)
+
+    def test_side_buttons_and_both_wheel_axes_survive_conversion(self) -> None:
+        events = [
+            {
+                "t": 0.0,
+                "type": "mouse_button",
+                "x": 50,
+                "y": 60,
+                "button": "x1",
+                "pressed": True,
+            },
+            {
+                "t": 0.1,
+                "type": "mouse_button",
+                "x": 50,
+                "y": 60,
+                "button": "x1",
+                "pressed": False,
+            },
+            {
+                "t": 0.2,
+                "type": "mouse_button",
+                "x": 50,
+                "y": 60,
+                "button": "x2",
+                "pressed": True,
+            },
+            {
+                "t": 0.3,
+                "type": "mouse_scroll",
+                "x": 50,
+                "y": 60,
+                "dx": 2,
+                "dy": -3,
+            },
+        ]
+
+        normalized = validate_events(events)
+        script = events_to_script(normalized)
+
+        self.assertEqual([normalized[0]["button"], normalized[2]["button"]], ["x1", "x2"])
+        self.assertIn("DOWN x1", script)
+        self.assertIn("UP x1", script)
+        self.assertIn("DOWN x2", script)
+        self.assertIn("SCROLL 2 -3", script)
 
     def test_relative_mouse_drag_survives_validation_and_becomes_move_by(self) -> None:
         events = [

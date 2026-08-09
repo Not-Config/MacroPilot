@@ -127,7 +127,13 @@ class AutomationRunnerTests(unittest.TestCase):
         # operating system. Native SendInput selection has its own focused test.
         main.WINDOWS_NATIVE_AVAILABLE = False
         main.mouse = types.SimpleNamespace(
-            Button=types.SimpleNamespace(left="mouse:left", right="mouse:right", middle="mouse:middle"),
+            Button=types.SimpleNamespace(
+                left="mouse:left",
+                right="mouse:right",
+                middle="mouse:middle",
+                x1="mouse:x1",
+                x2="mouse:x2",
+            ),
             Controller=lambda: self.mouse_controller,
         )
         main.keyboard = types.SimpleNamespace(
@@ -141,6 +147,12 @@ class AutomationRunnerTests(unittest.TestCase):
         main.keyboard = self.original_keyboard
         main.WINDOWS_NATIVE_AVAILABLE = self.original_windows_native_available
 
+    def test_windows_pynput_backend_exposes_side_buttons(self) -> None:
+        if not self.original_windows_native_available or self.original_mouse is None:
+            self.skipTest("requires Windows pynput backend")
+        self.assertTrue(hasattr(self.original_mouse.Button, "x1"))
+        self.assertTrue(hasattr(self.original_mouse.Button, "x2"))
+
     def test_executes_script_commands(self) -> None:
         finished = []
         runner = main.AutomationRunner(
@@ -152,6 +164,9 @@ class AutomationRunnerTests(unittest.TestCase):
             '''
             MOVE 10 20
             CLICK right 2 0
+            CLICK x1
+            DOWN x2
+            UP x2
             SCROLL 1 -2
             PRESS enter
             HOTKEY ctrl s
@@ -163,6 +178,10 @@ class AutomationRunnerTests(unittest.TestCase):
         self.assertEqual(finished, [(False, None)])
         self.assertIn(("move", (10, 20)), self.mouse_controller.log)
         self.assertEqual(self.mouse_controller.log.count(("press", "mouse:right")), 2)
+        self.assertIn(("press", "mouse:x1"), self.mouse_controller.log)
+        self.assertIn(("release", "mouse:x1"), self.mouse_controller.log)
+        self.assertIn(("press", "mouse:x2"), self.mouse_controller.log)
+        self.assertIn(("release", "mouse:x2"), self.mouse_controller.log)
         self.assertIn(("scroll", 1, -2), self.mouse_controller.log)
         self.assertIn(("press", "key:enter"), self.keyboard_controller.log)
         self.assertIn(("press", "key:ctrl"), self.keyboard_controller.log)
@@ -422,6 +441,27 @@ class AutomationRunnerTests(unittest.TestCase):
             False,
         )
         self.assertEqual(recorder.snapshot()[0]["type"], "mouse_button")
+
+    def test_recorder_captures_wheel_click_side_buttons_and_scroll(self) -> None:
+        recorder = main.EventRecorder(True, lambda _reason: None, lambda _error: None)
+        recorder.active = True
+        recorder.started_at = time.perf_counter()
+
+        for name in ("middle", "x1", "x2"):
+            button = types.SimpleNamespace(name=name)
+            recorder._on_click(100, 200, button, True, False)
+            recorder._on_click(100, 200, button, False, False)
+        recorder._on_scroll(100, 200, 2, -3, False)
+
+        events = recorder.snapshot()
+        self.assertEqual(
+            [event["button"] for event in events if event["type"] == "mouse_button"],
+            ["middle", "middle", "x1", "x1", "x2", "x2"],
+        )
+        self.assertEqual(
+            (events[-1]["type"], events[-1]["dx"], events[-1]["dy"]),
+            ("mouse_scroll", 2, -3),
+        )
 
     def test_recording_precision_changes_mouse_sampling_interval(self) -> None:
         recorder = main.EventRecorder(
@@ -780,11 +820,13 @@ class AutomationRunnerTests(unittest.TestCase):
         self.assertEqual(lifecycle[0], "start")
         self.assertEqual(lifecycle[-1], "stop")
         self.assertEqual(
-            lifecycle[1:4],
+            lifecycle[1:6],
             [
                 ("release", "mouse:left"),
                 ("release", "mouse:right"),
                 ("release", "mouse:middle"),
+                ("release", "mouse:x1"),
+                ("release", "mouse:x2"),
             ],
         )
         self.assertEqual(lifecycle[-2], ("release", "mouse:left"))
