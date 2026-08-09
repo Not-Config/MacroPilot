@@ -71,6 +71,10 @@ class GraphModelTests(unittest.TestCase):
         branch = next(node for node in graph.nodes if node.type == "branch_number")
         self.assertEqual(len(graph.incoming(branch.id, "value")), 1)
 
+    def test_side_mouse_buttons_round_trip_through_graph(self) -> None:
+        source = "CLICK x1 1 0.1\nDOWN x2\nUP x2\nSCROLL 2 -3\n"
+        self.assertEqual(graph_to_script(script_to_graph(source)), source)
+
     def test_constant_data_node_can_feed_numeric_input(self) -> None:
         graph = GraphDocument()
         start = graph.add_node("start")

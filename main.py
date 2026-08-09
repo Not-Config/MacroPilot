@@ -23,6 +23,7 @@ from image_matcher import ImageMatch, ScreenImageMatcher
 from macro_core import (
     APP_NAME,
     APP_VERSION,
+    BUTTONS,
     EXAMPLE_SCRIPT,
     IfBlock,
     MAX_EVENTS,
@@ -165,7 +166,7 @@ REPEAT число
 END
 
 КНОПКИ МЫШИ
-left, right, middle
+left, right, middle (колесо), x1, x2
 
 ПОИСК ИЗОБРАЖЕНИЯ
 Тайм-аут 0 ожидает без ограничения.
@@ -270,11 +271,14 @@ def resolve_script_key(token: str) -> Any:
 def resolve_button(name: str) -> Any:
     if mouse is None:
         raise RuntimeError("pynput недоступен")
-    return {
-        "left": mouse.Button.left,
-        "right": mouse.Button.right,
-        "middle": mouse.Button.middle,
-    }[name]
+    if name not in BUTTONS:
+        raise ValueError(f"Неизвестная кнопка мыши: {name!r}")
+    try:
+        return getattr(mouse.Button, name)
+    except AttributeError as exc:
+        raise RuntimeError(
+            f"Системный драйвер мыши не поддерживает кнопку {name}"
+        ) from exc
 
 
 class EventRecorder:
@@ -576,7 +580,7 @@ class EventRecorder:
         if not self.active or self.stop_requested.is_set():
             return
         name = getattr(button, "name", None)
-        if name not in {"left", "right", "middle"}:
+        if name not in BUTTONS:
             return
         notifications: list[tuple[str | None, bool]] = []
         with self.lock:
@@ -1228,7 +1232,7 @@ class AutomationRunner:
         # If playback started while a physical button was held, the target
         # application may already consider it pressed. Tagged UP events pass
         # through the blocker and reset that state before the macro begins.
-        for button_name in ("left", "right", "middle"):
+        for button_name in BUTTONS:
             self.mouse_controller.release(resolve_button(button_name))
 
     def _run(self, task: Callable[[], Any]) -> None:

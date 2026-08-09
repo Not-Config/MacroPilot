@@ -15,6 +15,8 @@ from windows_input import (
     MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN,
     MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP,
     MOUSE_MOVE_ABSOLUTE,
     MOUSEEVENTF_MOVE,
     MOUSEEVENTF_MOVE_NOCOALESCE,
@@ -22,6 +24,8 @@ from windows_input import (
     MOUSEEVENTF_RIGHTUP,
     MOUSEEVENTF_VIRTUALDESK,
     MOUSEEVENTF_WHEEL,
+    MOUSEEVENTF_XDOWN,
+    MOUSEEVENTF_XUP,
     RAWINPUT,
     RAWINPUTDEVICE,
     RAWINPUTHEADER,
@@ -33,6 +37,8 @@ from windows_input import (
     WindowsPhysicalMouseBlocker,
     WindowsRawMouseListener,
     WINDOWS_NATIVE_AVAILABLE,
+    XBUTTON1,
+    XBUTTON2,
     get_pressed_scan_keys,
     parse_scan_token,
     scan_token,
@@ -281,6 +287,27 @@ class WindowsInputTests(unittest.TestCase):
         self.assertEqual(user32.sent[0][-1], MOUSEEVENTF_RIGHTDOWN)
         self.assertTrue(user32.sent[1][-1] & MOUSEEVENTF_MOVE)
         self.assertEqual(user32.sent[2][-1], MOUSEEVENTF_RIGHTUP)
+
+    def test_native_mouse_supports_wheel_click_and_side_buttons(self):
+        user32 = FakeUser32()
+        controller = WindowsMouseController(user32=user32)
+
+        for name in ("middle", "x1", "x2"):
+            button = types.SimpleNamespace(name=name)
+            controller.press(button)
+            controller.release(button)
+
+        self.assertEqual(
+            user32.sent,
+            [
+                ("mouse", 0, 0, 0, MOUSEEVENTF_MIDDLEDOWN),
+                ("mouse", 0, 0, 0, MOUSEEVENTF_MIDDLEUP),
+                ("mouse", 0, 0, XBUTTON1, MOUSEEVENTF_XDOWN),
+                ("mouse", 0, 0, XBUTTON1, MOUSEEVENTF_XUP),
+                ("mouse", 0, 0, XBUTTON2, MOUSEEVENTF_XDOWN),
+                ("mouse", 0, 0, XBUTTON2, MOUSEEVENTF_XUP),
+            ],
+        )
 
 
 if __name__ == "__main__":

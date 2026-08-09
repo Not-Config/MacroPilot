@@ -48,12 +48,16 @@ MOUSEEVENTF_RIGHTDOWN = 0x0008
 MOUSEEVENTF_RIGHTUP = 0x0010
 MOUSEEVENTF_MIDDLEDOWN = 0x0020
 MOUSEEVENTF_MIDDLEUP = 0x0040
+MOUSEEVENTF_XDOWN = 0x0080
+MOUSEEVENTF_XUP = 0x0100
 MOUSEEVENTF_WHEEL = 0x0800
 MOUSEEVENTF_HWHEEL = 0x1000
 MOUSEEVENTF_MOVE_NOCOALESCE = 0x2000
 MOUSEEVENTF_VIRTUALDESK = 0x4000
 MOUSEEVENTF_ABSOLUTE = 0x8000
 WHEEL_DELTA = 120
+XBUTTON1 = 0x0001
+XBUTTON2 = 0x0002
 
 RID_INPUT = 0x10000003
 RIM_TYPEMOUSE = 0
@@ -967,10 +971,12 @@ class WindowsPhysicalMouseBlocker:
 class WindowsMouseController:
     """Mouse sender using real SendInput events for game UI compatibility."""
 
-    _BUTTON_FLAGS = {
-        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
-        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP),
-        "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
+    _BUTTON_INPUTS = {
+        "left": (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, 0),
+        "right": (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, 0),
+        "middle": (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, 0),
+        "x1": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON1),
+        "x2": (MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, XBUTTON2),
     }
 
     def __init__(self, user32: Any | None = None) -> None:
@@ -1055,17 +1061,21 @@ class WindowsMouseController:
         name = getattr(button, "name", None)
         if name is None:
             name = str(button).lower().rsplit(".", 1)[-1].rsplit(":", 1)[-1]
-        if name not in WindowsMouseController._BUTTON_FLAGS:
+        if name not in WindowsMouseController._BUTTON_INPUTS:
             raise ValueError(f"Неизвестная кнопка мыши: {button!r}")
         return name
 
     def press(self, button: Any) -> None:
-        down_flag, _up_flag = self._BUTTON_FLAGS[self._button_name(button)]
-        self._send(0, 0, 0, down_flag)
+        down_flag, _up_flag, mouse_data = self._BUTTON_INPUTS[
+            self._button_name(button)
+        ]
+        self._send(0, 0, mouse_data, down_flag)
 
     def release(self, button: Any) -> None:
-        _down_flag, up_flag = self._BUTTON_FLAGS[self._button_name(button)]
-        self._send(0, 0, 0, up_flag)
+        _down_flag, up_flag, mouse_data = self._BUTTON_INPUTS[
+            self._button_name(button)
+        ]
+        self._send(0, 0, mouse_data, up_flag)
 
     def scroll(self, dx: int, dy: int) -> None:
         if dx:

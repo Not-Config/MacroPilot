@@ -83,7 +83,7 @@ class NodeSpec:
 
 EXEC_IN = (PortSpec("in", "Вход", "exec", "input", True),)
 EXEC_OUT = (PortSpec("out", "Дальше", "exec", "output"),)
-BUTTON_CHOICES = ("left", "right", "middle")
+BUTTON_CHOICES = ("left", "right", "middle", "x1", "x2")
 
 
 def _f(

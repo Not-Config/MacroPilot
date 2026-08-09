@@ -19,7 +19,7 @@ from macro_core import (
 )
 
 
-BUTTONS = ("left", "right", "middle")
+BUTTONS = ("left", "right", "middle", "x1", "x2")
 
 
 @dataclass(frozen=True, slots=True)

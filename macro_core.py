@@ -14,7 +14,7 @@ from windows_input import scan_key_from_descriptor, scan_token
 
 
 APP_NAME = "MacroPilot"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 MACRO_FORMAT = "MacroPilot macro"
 MACRO_VERSION = 1
 MAX_MACRO_BYTES = 128 * 1024 * 1024
@@ -33,7 +33,7 @@ VARIABLE_TEMPLATE_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]{0,63})\}")
 TEXT_COMPARISON_OPERATORS = {"==", "!=", "CONTAINS", "NOT_CONTAINS"}
 NUMBER_COMPARISON_OPERATORS = {"==", "!=", "<", "<=", ">", ">="}
 
-BUTTONS = {"left", "right", "middle"}
+BUTTONS = ("left", "right", "middle", "x1", "x2")
 EVENT_TYPES = {
     "mouse_move",
     "mouse_move_relative",
@@ -141,13 +141,22 @@ def _button(token: str, line_no: int) -> str:
         "лкм": "left",
         "пкм": "right",
         "скм": "middle",
+        "колесо": "middle",
+        "wheel": "middle",
+        "боковая1": "x1",
+        "боковая2": "x2",
+        "назад": "x1",
+        "вперёд": "x2",
+        "вперед": "x2",
+        "back": "x1",
+        "forward": "x2",
         "левая": "left",
         "правая": "right",
         "средняя": "middle",
     }
     value = aliases.get(value, value)
     if value not in BUTTONS:
-        raise ScriptError(line_no, "кнопка мыши: left, right или middle")
+        raise ScriptError(line_no, "кнопка мыши: left, right, middle, x1 или x2")
     return value
 
 
@@ -631,7 +640,9 @@ def validate_events(events: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
         elif event_type == "mouse_button":
             button = event.get("button")
             if button not in BUTTONS:
-                raise MacroFormatError(f"{label}.button: left, right или middle")
+                raise MacroFormatError(
+                    f"{label}.button: left, right, middle, x1 или x2"
+                )
             pressed = event.get("pressed")
             if not isinstance(pressed, bool):
                 raise MacroFormatError(f"{label}.pressed: требуется true или false")
